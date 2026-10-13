@@ -120,6 +120,8 @@ def test_media_id_is_not_post_id_and_ambiguous_match_is_not_success():
     assert matching_post([item, {**item, "id": "998"}], row, journal) is None
     assert matching_post([{**item, "author": {"id": "200"}}], row, journal) is None
     assert matching_post([item], row, {**journal, "post_ids": []}) is None
+    assert matching_post([{**item, "desc": "TikTok-normalized caption", "create_time": now + 7200}], row,
+                         {**journal, "post_ids": ["999"], "operator_confirmed": True})["remote_id"] == "999"
     assert matching_post([{**item, "creation_id": "exact-creation"}], row,
                          {**journal, "post_ids": [], "creation_id": "exact-creation"})["remote_id"] == "999"
 

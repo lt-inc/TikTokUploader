@@ -38,9 +38,10 @@ def matching_post(items: list[dict], row: dict, journal: dict) -> dict | None:
             created = float(created)
         except (TypeError, ValueError):
             continue
-        if not pid.isdigit() or not caption or caption != journal.get("caption"):
+        operator_link = bool(journal.get("operator_confirmed")) and pid in known
+        if not pid.isdigit() or (not operator_link and (not caption or caption != journal.get("caption"))):
             continue
-        if not started - 120 <= created <= started + 900:
+        if not operator_link and not started - 120 <= created <= started + 900:
             continue
         if known and pid not in known:
             continue
