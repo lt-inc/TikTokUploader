@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from autotok.uploader import Client
 from terex_tiktok.config import Config
 from terex_tiktok.connections import Connections
-from terex_tiktok.identity import Identity, checked_cookies
+from terex_tiktok.identity import Identity, SessionRejected, checked_cookies
 from terex_tiktok.main_client import Fenced, Lease
 from terex_tiktok.reconcile import matching_post, response_post_ids
 from terex_tiktok.store import EncryptedStore
