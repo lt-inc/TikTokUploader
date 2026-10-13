@@ -54,6 +54,8 @@ def test_pairing_single_use_and_wrong_identity_preserves_account(tmp_path):
     service.start(1, "z" * 32, expiry, "100")
     with pytest.raises(ValueError, match="newer connection request"):
         service.accept(1, cookies(), "real browser agent", Identity("100", "alice", "Alice"), 1, generation)
+    identity[0] = Identity("100", "alice", "Alice")
+    assert service.receive("z" * 32, cookies(), "real browser agent", "https://www.tiktok.com")["session_version"] == 2
     with pytest.raises(ValueError, match="Only tiktok.com"):
         checked_cookies([{"name": "sessionid", "value": "x", "domain": "evil-tiktok.com"}])
 

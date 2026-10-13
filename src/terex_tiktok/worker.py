@@ -238,11 +238,19 @@ class Worker:
         except (NotLoggedInError, SessionRejected):
             with self.store.lock:
                 current = self.store.get("account", journal["account_id"])
-                if current and current.get("session_version") == journal["session_version"]:
+                replaced = bool(current and current.get("session_version") != journal["session_version"])
+                if current and not replaced:
                     current.update(status="needs_reauth", error="Reconnect this TikTok account or finish browser verification.")
                     self.store.put("account", journal["account_id"], current)
-            self._failure(lease, "blocked", "auth_required", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
-            UPLOADS.labels("needs_reauth").inc()
+            if replaced:
+                if external_started or journal.get("phase") in ("submitting", "accepted"):
+                    self._failure(lease, "needs_attention", "upload_unknown", "The session changed after submission. Verify the existing post with the renewed account session.")
+                else:
+                    self._failure(lease, "failed", "session_changed", "A renewed session replaced this attempt before publication; preparation may be retried.", retryable=True)
+                UPLOADS.labels("session_changed").inc()
+            else:
+                self._failure(lease, "blocked", "auth_required", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
+                UPLOADS.labels("needs_reauth").inc()
         except Exception as exc:
             if external_started or journal.get("phase") in ("submitting", "accepted"):
                 self._failure(lease, "needs_attention", "upload_unknown", "The final publication result is uncertain. Check the post; automatic upload retry is blocked.")

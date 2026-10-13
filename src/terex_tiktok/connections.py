@@ -85,7 +85,7 @@ class Connections:
                 row.pop("pending_user_agent", None)
                 self.store.put("account", account_id, row)
                 raise ValueError(row["error"])
-            changed = row.get("cookies") != cookies or row.get("user_agent") != agent or not row.get("session_ref")
+            changed = row.get("cookies") != cookies or row.get("user_agent") != agent or not row.get("session_ref") or bool(row.get("pending_cookies")) or row.get("status") == "needs_reauth"
             row.update(cookies=cookies, user_agent=agent, status="connected", error=None,
                        remote_account_id=identity.remote_account_id, username=identity.username,
                        display_name=identity.display_name, verified_at=iso_now())
