@@ -11,7 +11,7 @@ from autotok.browsers import sync_playwright
 from .browser import browser_permit, open_context
 from .captcha import CaptchaProvider
 from .connections import Connections
-from .identity import checked_cookies, verify_identity
+from .identity import SessionRejected, checked_cookies, verify_identity
 from .metrics import HELP
 
 
@@ -27,6 +27,12 @@ class BrowserHelp:
         if not row or row.get("status") == "disconnected":
             raise ValueError("Connect/export the account before opening browser help")
         with self.lock:
+            for token, active in self.sessions.items():
+                if active["account_id"] == account_id and active.get("publication") and active["expires_at"] > time.time() and not active["stop"].is_set():
+                    reply = self.connections.public(row)
+                    reply.update(help_url=f"{self.config.public_url}/api/tiktok/browser-help/{token}/", status="challenge",
+                                 expires_at=datetime.fromtimestamp(active["expires_at"], timezone.utc).isoformat())
+                    return reply
             if any(s["expires_at"] > time.time() and not s["stop"].is_set() for s in self.sessions.values()):
                 raise ValueError("Another operator browser is open; close it first")
             token = secrets.token_urlsafe(32)
@@ -55,6 +61,70 @@ class BrowserHelp:
                     session["stop"].set()
                     raise ValueError("Account connection changed; browser help closed")
             return session
+
+    def verify_for_publish(self, row: dict, guard, on_wait) -> dict:
+        """Pre-submit device checks keep the already transferred media intact.
+
+        Browser operations stay on the publishing thread. HTTP helpers only
+        signal finish/stop; they never call Playwright on a foreign thread.
+        """
+        with browser_permit(), sync_playwright() as pw:
+            browser, context = open_context(pw, row, self.config.proxy_url, headless=False)
+            token = None
+            try:
+                guard()
+                page = context.new_page()
+                page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                challenge = page.locator("img#captcha-verify-image")
+                pending = "/login" in page.url or challenge.is_visible()
+                if pending:
+                    with contextlib.suppress(Exception):
+                        if CaptchaProvider(self.config).try_challenge(page):
+                            pending = False
+                if pending:
+                    token = secrets.token_urlsafe(32)
+                    session = {"account_id": row["account_id"], "expires_at": time.time() + 600,
+                               "version": row["session_version"], "pairing_generation": row.get("pairing_generation", 0),
+                               "status": "active", "stop": threading.Event(), "finish": threading.Event(),
+                               "ready": threading.Event(), "error": None, "publication": True}
+                    session["ready"].set()
+                    with self.lock:
+                        self.sessions[token] = session
+                    HELP.inc()
+                    on_wait()
+                    while time.time() < session["expires_at"] and not session["stop"].is_set():
+                        guard()
+                        self.require(token)
+                        if session["finish"].is_set():
+                            break
+                        page.wait_for_timeout(500)
+                    if not session["finish"].is_set() or challenge.is_visible() or "/login" in page.url:
+                        raise SessionRejected("Complete the TikTok verification before publishing")
+                guard()
+                cookies = checked_cookies(context.cookies())
+                identity = verify_identity(cookies, row["user_agent"], self.config.proxy_url)
+                if identity.remote_account_id != row["remote_account_id"]:
+                    raise SessionRejected("A different TikTok account is logged in")
+                with self.connections.store.lock:
+                    current = self.connections.require(row["account_id"], row["session_version"], row["remote_account_id"])
+                    # Verification enriches this connection's cookies; an
+                    # exported/reconnected session still increments its version.
+                    current["cookies"] = cookies
+                    self.connections.store.put("account", row["account_id"], current)
+                if token:
+                    session["status"] = "completed"
+                return current
+            except Exception:
+                if token:
+                    session["status"] = "failed"
+                raise
+            finally:
+                if token:
+                    session["stop"].set()
+                    HELP.dec()
+                context.close()
+                browser.close()
 
     def cancel_account(self, account_id: int):
         with self.lock:

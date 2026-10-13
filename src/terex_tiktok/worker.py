@@ -33,7 +33,7 @@ QUEUE = "tiktok.workflow.v1.publish"
 
 
 class Worker:
-    def __init__(self, config: Config, store: EncryptedStore, connections: Connections, owner: ProcessOwnership | None = None):
+    def __init__(self, config: Config, store: EncryptedStore, connections: Connections, owner: ProcessOwnership | None = None, browser_help=None):
         self.config, self.store, self.connections = config, store, connections
         self.main = MainClient(config)
         self.worker_id = f"tiktok-{uuid.uuid4()}"
@@ -41,6 +41,7 @@ class Worker:
         self.broker_connected = False
         self.thread = threading.Thread(target=self.run, daemon=True, name="tiktok-publisher")
         self.owner = owner
+        self.browser_help = browser_help
 
     def start(self):
         if not self.owner or not self.owner.held:
@@ -77,10 +78,11 @@ class Worker:
     def _checkpoint(self, lease: Lease, journal: dict, state: str, *, submitting=False):
         checkpoint = {k: journal.get(k) for k in ("creation_id", "media_id", "phase", "submitted_at", "post_ids", "caption") if journal.get(k) is not None}
         lease.checkpoint(state, checkpoint, final_request_started=submitting)
+        log.info("publishing stage", extra={"publication_id": journal["publication_id"], "attempt_id": journal["attempt_id"], "phase": state})
 
-    def _failure(self, lease: Lease, state: str, code: str, message: str, retryable=False):
+    def _failure(self, lease: Lease, state: str, code: str, message: str, retryable=False, reconnect_required=False):
         response = self.main.call("fail", {**lease.fields, "state": state, "code": code, "error_code": code,
-            "error": message, "message": message, "retryable": retryable})
+            "error": message, "message": message, "retryable": retryable, "reconnect_required": reconnect_required})
         if response.get("accepted") is False:
             raise Fenced("Terex rejected the failure report")
 
@@ -156,7 +158,8 @@ class Worker:
         lease.start()
         ACTIVE.inc()
         prepared = None
-        deadline = time.monotonic() + 900
+        started = time.monotonic()
+        deadline = started + 900
         external_started = False
         def guard():
             lease.check()
@@ -188,6 +191,12 @@ class Worker:
                     self.store.put("publication", publication_id, journal)
                     self._checkpoint(lease, journal, "uploading")
                     TRANSFER.labels("upload").inc(size)
+                if self.browser_help:
+                    # Keep the transferred project while the operator solves
+                    # any device/CAPTCHA check in this very browser.
+                    row = self.browser_help.verify_for_publish(row, guard, lambda: self._checkpoint(lease, journal, "processing"))
+                    for cookie in row["cookies"]:
+                        prepared["session"].cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path", "/"))
                 with STAGES.labels("prepare_publish").time(), browser_permit():
                     uploader.prepare_publish(prepared)
                 def barrier():
@@ -220,13 +229,14 @@ class Worker:
                 journal["phase"] = "published"
                 self.store.put("publication", publication_id, journal)
                 UPLOADS.labels("published").inc()
+                log.info("post confirmed", extra={"publication_id": publication_id, "attempt_id": claim["attempt_id"], "size_bytes": size, "result": "published"})
         except PublishError:
             journal["phase"] = "rejected"
             self.store.put("publication", publication_id, journal)
             self._failure(lease, "needs_attention", "tiktok_rejected", "TikTok rejected publication; review the account and video before retrying.")
             UPLOADS.labels("rejected").inc()
         except (NotLoggedInError, SessionRejected):
-            self._failure(lease, "needs_attention", "needs_reauth", "TikTok account needs reconnection or browser verification.")
+            self._failure(lease, "needs_attention", "needs_reauth", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
             UPLOADS.labels("needs_reauth").inc()
         except Exception as exc:
             if external_started or journal.get("phase") in ("submitting", "accepted"):
@@ -241,6 +251,7 @@ class Worker:
                 prepared["session"].close()
             lease.close()
             ACTIVE.dec()
+            log.info("publishing operation ended", extra={"publication_id": publication_id, "attempt_id": claim["attempt_id"], "phase": journal["phase"], "duration_ms": round((time.monotonic() - started) * 1000)})
             # Reset maintenance waits for physical operations to end. Lease
             # expiry alone must never be treated as an acknowledgement.
             journal["operation_ended"] = True

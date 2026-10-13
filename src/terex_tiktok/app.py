@@ -55,7 +55,7 @@ def create_app(config: Config | None = None, *, start_worker=True) -> FastAPI:
     connections = Connections(store, config)
     help_manager = BrowserHelp(connections)
     owner = ProcessOwnership(config.state_dir)
-    worker = Worker(config, store, connections, owner)
+    worker = Worker(config, store, connections, owner, help_manager)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -267,9 +267,8 @@ const timer=setInterval(async()=>{{const r=await fetch(path+'status');if(!r.ok){
 
 def run():
     import uvicorn
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s level=%(levelname)s service=tiktok-uploader msg=%(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    from .logging_setup import configure_logging
+    configure_logging()
     uvicorn.run(create_app(), host="0.0.0.0", port=int(os.environ.get("TIKTOK_HTTP_PORT", 8080)), access_log=False)
 
 

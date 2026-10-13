@@ -156,6 +156,11 @@ class Client:
 
     def _session(self) -> requests.Session:
         s = proxied_session(self.proxy)
+        # Preserve the verified browser session, including device/CSRF cookies.
+        for cookie in self.account.cookies:
+            domain = str(cookie.get("domain", ".tiktok.com"))
+            if domain.lstrip(".") == "tiktok.com" or domain.lstrip(".").endswith(".tiktok.com"):
+                s.cookies.set(cookie["name"], cookie["value"], domain=domain, path=cookie.get("path", "/"))
         s.cookies.set("sessionid", self.account.session_id, domain=".tiktok.com")
         datacenter = self.account.datacenter
         if not datacenter:
