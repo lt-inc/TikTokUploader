@@ -6,3 +6,5 @@ __pycache__/
 state/
 scratch/
 dist/
+build/
+*.egg-info/

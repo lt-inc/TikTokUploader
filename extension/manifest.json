@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Terex TikTok Connect",
+  "version": "0.1.0",
+  "description": "Connect your logged-in TikTok account to Terex after an explicit export click.",
+  "permissions": ["cookies", "activeTab"],
+  "host_permissions": ["https://*.tiktok.com/*", "https://tiktok.com/*"],
+  "optional_host_permissions": ["https://admin.legendary-trio.me/*"],
+  "action": {"default_popup": "popup.html"}
+}
