@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir . && phantomwright_driver install --with-deps chr
     && useradd --uid 10001 --create-home --home-dir /tmp/home app \
     && mkdir -p /data/sessions && chown -R app:app /data /opt/browsers
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod 755 /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod 755 /app/entrypoint.sh
 USER app
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

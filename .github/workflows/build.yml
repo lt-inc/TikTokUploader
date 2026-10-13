@@ -43,6 +43,22 @@ jobs:
               assert page.locator("#smoke").inner_text() == "runtime-ready"
               browser.close()
           print("Production Phantomwright runtime ready")'
+      - name: Smoke the real application entrypoint
+        env:
+          IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+        run: |
+          docker run -d --name publisher-smoke --read-only --tmpfs /tmp:rw,size=512m --shm-size=128m \
+            -e TIKTOK_STATE_DIR=/tmp/state -e TIKTOK_SCRATCH_DIR=/tmp/scratch \
+            -e TIKTOK_UPLOADER_API_TOKEN=smoke -e TIKTOK_WORKER_TOKEN=smoke \
+            -e TIKTOK_SESSION_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+            -e TIKTOK_MAIN_BE_URL=http://127.0.0.1:8000 -e APP_PUBLIC_URL=https://admin.legendary-trio.me \
+            -e RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/ "$IMAGE"
+          trap 'docker logs publisher-smoke; docker rm -f publisher-smoke' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec publisher-smoke python -c 'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8080/healthz").status == 200'; then exit 0; fi
+            sleep 2
+          done
+          exit 1
       - name: Publish the bootstrap tag on master
         if: github.ref == 'refs/heads/master'
         run: |
