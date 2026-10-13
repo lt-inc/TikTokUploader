@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Connect TikTok to Terex</title>
+<style>body{width:340px;padding:16px;background:#111827;color:#f3f4f6;font:14px system-ui}input,button{box-sizing:border-box;width:100%;padding:10px;margin:6px 0 14px;border-radius:6px}button{background:#22c55e;font-weight:700;cursor:pointer}p{line-height:1.5}#result{white-space:pre-wrap}</style>
+<h2>Connect your TikTok account</h2>
+<p>Open TikTok in this browser and sign in to the account you want to connect. Generate a ten-minute connection code in Terex.</p>
+<label>Terex address<input id="server" type="url" value="https://admin.legendary-trio.me" autocomplete="off" readonly></label>
+<label>Connection code<input id="code" type="password" autocomplete="off" placeholder="Paste the code from Terex"></label>
+<p>Clicking below exports only TikTok cookies, including the login session, to the Terex address shown above. No other browser accounts or cookies are read.</p>
+<button id="send">Export TikTok session and connect</button><p id="result" role="status"></p>
+<script src="popup.js"></script></html>

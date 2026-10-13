@@ -1,0 +1,74 @@
+name: Build publisher image
+on:
+  push:
+    branches: [master, 'codex/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install '.[test]'
+      - run: python -m compileall -q src && pytest -q
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: registry.legendary-trio.me
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+          build-args: SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke the production browser runtime without external sites
+        env:
+          IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+        run: |
+          docker pull "$IMAGE"
+          docker run --rm --read-only --tmpfs /tmp:rw,size=256m --shm-size=256m --entrypoint python "$IMAGE" -c '
+          from autotok.browsers import sync_playwright
+          with sync_playwright() as pw:
+              browser = pw.chromium.launch(headless=True)
+              page = browser.new_page()
+              page.set_content("<main id=smoke>runtime-ready</main>")
+              assert page.locator("#smoke").inner_text() == "runtime-ready"
+              browser.close()
+          print("Production Phantomwright runtime ready")'
+  deploy:
+    needs: image
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.33.5'
+      - name: Update the existing publisher image
+        env:
+          KUBE_HOST: ${{ secrets.KUBE_HOST }}
+          KUBE_TOKEN: ${{ secrets.KUBE_TOKEN }}
+          KUBE_CA: ${{ secrets.KUBE_CA }}
+          RELEASE_IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          cluster = {"server": "https://" + os.environ["KUBE_HOST"], "certificate-authority-data": os.environ["KUBE_CA"]}
+          config = {"apiVersion":"v1","kind":"Config","clusters":[{"name":"stage","cluster":cluster}],
+                    "users":[{"name":"release","user":{"token":os.environ["KUBE_TOKEN"]}}],
+                    "contexts":[{"name":"stage","context":{"cluster":"stage","user":"release","namespace":"admin"}}],"current-context":"stage"}
+          path = os.path.join(os.environ["RUNNER_TEMP"], "publisher-kubeconfig")
+          with open(path, "w") as file: json.dump(config, file)
+          os.chmod(path, 0o600)
+          PY
+          export KUBECONFIG="$RUNNER_TEMP/publisher-kubeconfig"
+          kubectl --request-timeout=30s -n admin set image deployment/terex-tiktok-uploader terex-tiktok-uploader="$RELEASE_IMAGE"
+          kubectl --request-timeout=30s -n admin rollout status deployment/terex-tiktok-uploader --timeout=600s
+          rm -f "$KUBECONFIG"

@@ -1,0 +1,16 @@
+name: Test uploader
+on:
+  push:
+  pull_request:
+jobs:
+  critical-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install '.[test]'
+      - run: python -m compileall -q src
+      - run: pytest -q
+      - run: docker build -t terex-tiktok-uploader:smoke .
