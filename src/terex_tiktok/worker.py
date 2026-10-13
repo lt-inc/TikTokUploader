@@ -236,7 +236,12 @@ class Worker:
             self._failure(lease, "needs_attention", "tiktok_rejected", "TikTok rejected publication; review the account and video before retrying.")
             UPLOADS.labels("rejected").inc()
         except (NotLoggedInError, SessionRejected):
-            self._failure(lease, "needs_attention", "needs_reauth", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
+            with self.store.lock:
+                current = self.store.get("account", journal["account_id"])
+                if current and current.get("session_version") == journal["session_version"]:
+                    current.update(status="needs_reauth", error="Reconnect this TikTok account or finish browser verification.")
+                    self.store.put("account", journal["account_id"], current)
+            self._failure(lease, "blocked", "auth_required", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
             UPLOADS.labels("needs_reauth").inc()
         except Exception as exc:
             if external_started or journal.get("phase") in ("submitting", "accepted"):
