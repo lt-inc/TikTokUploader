@@ -163,11 +163,10 @@ class Client:
                 s.cookies.set(cookie["name"], cookie["value"], domain=domain, path=cookie.get("path", "/"))
         s.cookies.set("sessionid", self.account.session_id, domain=".tiktok.com")
         datacenter = self.account.datacenter
-        if not datacenter:
-            log.warning("No TikTok datacenter cookie saved for '%s'; assuming %s. "
-                        "Log in again if uploads fail.", self.account.name, DEFAULT_DATACENTER)
-            datacenter = DEFAULT_DATACENTER
-        s.cookies.set("tt-target-idc", datacenter, domain=".tiktok.com")
+        # Inventing a region can route valid cookies to a different cluster
+        # and make TikTok report "Login expired". Preserve browser routing.
+        if datacenter:
+            s.cookies.set("tt-target-idc", datacenter, domain=".tiktok.com")
         s.headers.update({"User-Agent": self.user_agent, "Accept": "application/json, text/plain, */*"})
         return s
 
@@ -225,7 +224,9 @@ class Client:
         """Construct the final request; no publication is sent here."""
         self._guard()
         session = prepared["session"]
-        markup, extra = build_caption(prepared["caption"], make_user_resolver(session, self.user_agent, timeout=self.timeout))
+        # Terex has no confirmed Twitch-to-TikTok mention mapping. Keep emails
+        # and plain @names as text while retaining clickable hashtags.
+        markup, extra = build_caption(prepared["caption"])
         prepared["payload"] = self._payload(prepared["creation_id"], prepared["media_id"], prepared["caption"], markup, extra,
             prepared["visibility"], prepared["allow_comment"], prepared["allow_duet"], prepared["allow_stitch"], prepared["ai_label"])
         prepared["request"] = self._prepare_publish_request(session)

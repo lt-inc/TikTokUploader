@@ -10,6 +10,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from autotok.uploader import Client
+from autotok.accounts import Account
 from terex_tiktok.config import Config
 from terex_tiktok.connections import Connections
 from terex_tiktok.identity import Identity, SessionRejected, checked_cookies
@@ -31,6 +32,11 @@ def cookies(value="own-session"):
 
 
 def test_pairing_single_use_and_wrong_identity_preserves_account(tmp_path):
+    with Client(Account(name="browser-session", cookies=cookies(), user_agent="real browser agent"))._session() as session:
+        assert not any(cookie.name == "tt-target-idc" for cookie in session.cookies)
+    routed = cookies() + [{"name": "tt-target-idc", "value": "alisg", "domain": ".tiktok.com", "path": "/"}]
+    with Client(Account(name="routed-session", cookies=routed, user_agent="real browser agent"))._session() as session:
+        assert session.cookies.get("tt-target-idc", domain=".tiktok.com") == "alisg"
     cfg = config(tmp_path)
     store = EncryptedStore(cfg.state_dir, cfg.encryption_key)
     identity = [Identity("100", "alice", "Alice")]
@@ -74,6 +80,17 @@ def test_durable_barrier_fences_final_post_and_lease_expiry():
     assert calls == ["guard", "checkpoint"]
     client.submit(prepared, lambda: calls.append("ack"))
     assert calls[-4:] == ["guard", "ack", "guard", "send"]
+    client._prepare_publish_request = lambda session: ()
+    client._payload = lambda creation, media, caption, markup, extra, *args: {"markup": markup, "extra": extra}
+    caption = "Contact: ceo@legendary-trio.me · @twitch_streamer #twitch #моменты"
+    caption_prepared = {**prepared, "creation_id": "project", "media_id": "media", "caption": caption,
+                        "visibility": 1, "allow_comment": True, "allow_duet": False,
+                        "allow_stitch": False, "ai_label": False}
+    client.prepare_publish(caption_prepared)
+    assert "ceo@legendary-trio.me" in caption_prepared["payload"]["markup"]
+    assert "@twitch_streamer" in caption_prepared["payload"]["markup"]
+    assert [extra["hashtag_name"] for extra in caption_prepared["payload"]["extra"]] == ["twitch", "моменты"]
+    assert all(extra["type"] == 1 for extra in caption_prepared["payload"]["extra"])
     expiry = datetime.fromtimestamp(time.time() + 3, timezone.utc).isoformat()
     lease = Lease(object(), {"attempt_id": "a", "lease_token": "t", "expected_version": 1, "expires_at": expiry})
     with pytest.raises(Fenced):

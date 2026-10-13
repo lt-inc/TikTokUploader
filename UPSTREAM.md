@@ -6,7 +6,10 @@ Original author: Michael Peres. Core license: AGPL-3.0-only.
 
 LT-Inc changes (2026-10-13): split preparation, media transfer, request preparation
 and final submission; durable barrier/cancellation guard; classify ambiguous
-server responses; pinned Phantomwright browser runtime. The original CLI,
+server responses; pinned Phantomwright browser runtime; Terex caption preparation
+keeps email addresses and @names as plain text without a verified mention mapping.
+Browser session routing cookies are preserved without an invented datacenter.
+The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.
 

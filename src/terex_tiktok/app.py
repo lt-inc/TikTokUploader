@@ -269,7 +269,8 @@ def run():
     import uvicorn
     from .logging_setup import configure_logging
     configure_logging()
-    uvicorn.run(create_app(), host="0.0.0.0", port=int(os.environ.get("TIKTOK_HTTP_PORT", 8080)), access_log=False)
+    uvicorn.run(create_app(), host="0.0.0.0", port=int(os.environ.get("TIKTOK_HTTP_PORT", 8080)),
+                access_log=False, log_config=None)
 
 
 if __name__ == "__main__":
