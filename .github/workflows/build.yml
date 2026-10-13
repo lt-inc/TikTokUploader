@@ -43,6 +43,10 @@ jobs:
               assert page.locator("#smoke").inner_text() == "runtime-ready"
               browser.close()
           print("Production Phantomwright runtime ready")'
+      - name: Publish the bootstrap tag on master
+        if: github.ref == 'refs/heads/master'
+        run: |
+          docker buildx imagetools create --tag registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:latest registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
   deploy:
     needs: image
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
