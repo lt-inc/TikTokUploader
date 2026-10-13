@@ -97,7 +97,7 @@ class Worker:
         self.store.put("publication", journal["publication_id"], journal)
 
     def reconcile(self, journal: dict) -> bool:
-        row = self.connections.require(journal["account_id"], journal["session_version"], journal["remote_account_id"])
+        row = self.connections.for_verification(journal["account_id"], journal["remote_account_id"])
         if not journal.get("proof"):
             proof = inspect_posts(row, journal, self.config.proxy_url)
             if not proof:

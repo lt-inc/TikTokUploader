@@ -156,7 +156,7 @@ def create_app(config: Config | None = None, *, start_worker=True) -> FastAPI:
         journal = store.get("publication", payload.publication_id)
         if not journal or journal["account_id"] != payload.account_id or journal["remote_account_id"] != payload.remote_account_id:
             return {"verified": False}
-        row = connections.require(payload.account_id, journal["session_version"], payload.remote_account_id)
+        row = connections.for_verification(payload.account_id, payload.remote_account_id)
         proof = journal.get("proof")
         if proof and payload.remote_id and proof["remote_id"] != payload.remote_id:
             return {"verified": False}

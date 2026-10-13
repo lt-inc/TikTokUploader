@@ -120,3 +120,14 @@ class Connections:
         if not row or row.get("status") != "connected" or row.get("session_version") != version or row.get("remote_account_id") != remote_id:
             raise SessionRejected("TikTok session identity/version changed; publishing is fenced")
         return row
+
+    def for_verification(self, account_id: int, remote_id: str) -> dict:
+        """Read an already submitted post using a renewed session of its owner.
+
+        This capability never authorizes transfer or Publish: those operations
+        continue to require the exact version from their execution lease.
+        """
+        row = self.store.get("account", account_id)
+        if not row:
+            raise SessionRejected("Reconnect the original TikTok account before verifying its post")
+        return self.require(account_id, row.get("session_version"), remote_id)

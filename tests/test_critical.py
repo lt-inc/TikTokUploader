@@ -161,6 +161,9 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
         if operation == "release":
             assert payload == {"attempt_id": "attempt-1", "lease_token": "lease", "expected_version": 2}
             return httpx.Response(200, json={"accepted": True})
+        if operation == "reconcile":
+            assert payload["publication_id"] == 12 and payload["remote_account_id"] == "100"
+            return httpx.Response(200, json={"accepted": True})
         pytest.fail(f"unexpected operation {operation}")
     worker.main.client.close()
     worker.main.client = httpx.Client(base_url="http://main", transport=httpx.MockTransport(main_http))
@@ -183,6 +186,14 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
     journal = store.get("publication", 12)
     assert type(journal["publication_id"]) is int and type(journal["account_id"]) is int
     assert journal["phase"] == "published"
+    renewed = store.get("account", 18)
+    renewed["session_version"] = 2
+    store.put("account", 18, renewed)
+    with pytest.raises(SessionRejected):
+        connections.require(18, 1, "100")
+    with pytest.raises(SessionRejected):
+        connections.for_verification(18, "other-owner")
+    assert worker.reconcile(journal) is True
     with TestClient(create_app(cfg, start_worker=False)) as api:
         response = api.post("/v1/publications/verify", headers={"Authorization": "Bearer test-token"},
             json={"publication_id": 12, "account_id": 18, "remote_account_id": "100", "remote_id": "999"})
