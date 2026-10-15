@@ -258,7 +258,12 @@ class Worker:
             else:
                 self._failure(lease, "failed", "upload_preflight_failed", "Preparation/transfer failed before publication; safe to retry.", retryable=True)
                 UPLOADS.labels("preflight_failed").inc()
-            log.warning("upload failed publication_id=%s attempt_id=%s phase=%s error_type=%s", publication_id, claim["attempt_id"], journal["phase"], type(exc).__name__)
+            # Only TikTok-facing autotok errors carry a diagnostic safe to log:
+            # a step name, HTTP status and a short response excerpt, never cookies.
+            detail = ""
+            if isinstance(exc, AutotokError):
+                detail = f" detail={str(exc)[:300]!r} status={getattr(exc, 'status', None)} body={(getattr(exc, 'body', None) or '')[:200]!r}"
+            log.warning("upload failed publication_id=%s attempt_id=%s phase=%s error_type=%s%s", publication_id, claim["attempt_id"], journal["phase"], type(exc).__name__, detail)
         finally:
             if prepared:
                 prepared["session"].close()
