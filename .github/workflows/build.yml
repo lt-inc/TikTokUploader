@@ -1,40 +1,62 @@
-name: Build publisher image
+name: Build and Deploy
+
 on:
   push:
-    branches: [master, 'codex/**']
+    branches: [master]
   workflow_dispatch:
-permissions:
-  contents: read
+
+# Serialize application releases. Also keep CI idle during k3s Terraform plan/apply.
+concurrency:
+  group: terex-admin-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader
+
 jobs:
-  image:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install '.[test]'
       - run: python -m compileall -q src && pytest -q
+
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: registry.legendary-trio.me
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
-      - uses: docker/build-push-action@v6
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=,priority=1000
+
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+          provenance: false
           build-args: SOURCE_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
       - name: Smoke the production browser runtime without external sites
         env:
-          IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+          IMAGE_REF: ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
         run: |
-          docker pull "$IMAGE"
-          docker run --rm --read-only --tmpfs /tmp:rw,size=256m --shm-size=256m --entrypoint python "$IMAGE" -c '
+          docker run --rm --read-only --tmpfs /tmp:rw,size=256m --shm-size=256m --entrypoint python "$IMAGE_REF" -c '
           from autotok.browsers import sync_playwright
           with sync_playwright() as pw:
               browser = pw.chromium.launch(headless=True)
@@ -43,52 +65,54 @@ jobs:
               assert page.locator("#smoke").inner_text() == "runtime-ready"
               browser.close()
           print("Production Phantomwright runtime ready")'
+
       - name: Smoke the real application entrypoint
         env:
-          IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+          IMAGE_REF: ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
         run: |
           docker run -d --name publisher-smoke --read-only --tmpfs /tmp:rw,size=512m --shm-size=128m \
             -e TIKTOK_STATE_DIR=/tmp/state -e TIKTOK_SCRATCH_DIR=/tmp/scratch \
             -e TIKTOK_UPLOADER_API_TOKEN=smoke -e TIKTOK_WORKER_TOKEN=smoke \
             -e TIKTOK_SESSION_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
             -e TIKTOK_MAIN_BE_URL=http://127.0.0.1:8000 -e APP_PUBLIC_URL=https://admin.legendary-trio.me \
-            -e RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/ "$IMAGE"
+            -e RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/ "$IMAGE_REF"
           trap 'docker logs publisher-smoke; docker rm -f publisher-smoke' EXIT
           for attempt in $(seq 1 30); do
             if docker exec publisher-smoke python -c 'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8080/healthz").status == 200'; then exit 0; fi
             sleep 2
           done
           exit 1
-      - name: Publish the bootstrap tag on master
-        if: github.ref == 'refs/heads/master'
-        run: |
-          docker buildx imagetools create --tag registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:latest registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
+
+      # Bootstrap tag for the first k3s Terraform apply; the Deployment itself
+      # is rolled out below by the concrete SHA.
+      - name: Publish the bootstrap tag
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE_REF"
+
   deploy:
-    needs: image
-    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
     steps:
-      - uses: azure/setup-kubectl@v4
-        with:
-          version: 'v1.33.5'
-      - name: Update the existing publisher image
+      # Kubernetes structure, including Secrets, PVC and RabbitMQ bootstrap, is
+      # managed by Terraform in lt-inc/k3s. CI only changes the image on the
+      # existing Deployment, using the dedicated tiktok-github-deployer token.
+      - name: Update uploader image
+        uses: actions-hub/kubectl@master
         env:
           KUBE_HOST: ${{ secrets.KUBE_HOST }}
           KUBE_TOKEN: ${{ secrets.KUBE_TOKEN }}
-          KUBE_CA: ${{ secrets.KUBE_CA }}
-          RELEASE_IMAGE: registry.legendary-trio.me/lt-inc/terex-tiktok-uploader:${{ github.sha }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          cluster = {"server": "https://" + os.environ["KUBE_HOST"], "certificate-authority-data": os.environ["KUBE_CA"]}
-          config = {"apiVersion":"v1","kind":"Config","clusters":[{"name":"stage","cluster":cluster}],
-                    "users":[{"name":"release","user":{"token":os.environ["KUBE_TOKEN"]}}],
-                    "contexts":[{"name":"stage","context":{"cluster":"stage","user":"release","namespace":"admin"}}],"current-context":"stage"}
-          path = os.path.join(os.environ["RUNNER_TEMP"], "publisher-kubeconfig")
-          with open(path, "w") as file: json.dump(config, file)
-          os.chmod(path, 0o600)
-          PY
-          export KUBECONFIG="$RUNNER_TEMP/publisher-kubeconfig"
-          kubectl --request-timeout=30s -n admin set image deployment/terex-tiktok-uploader terex-tiktok-uploader="$RELEASE_IMAGE"
-          kubectl --request-timeout=30s -n admin rollout status deployment/terex-tiktok-uploader --timeout=600s
-          rm -f "$KUBECONFIG"
+          KUBE_CERTIFICATE: ${{ secrets.KUBE_CA }}
+        with:
+          args: set image deployment/terex-tiktok-uploader terex-tiktok-uploader=${{ env.IMAGE }}:${{ needs.build.outputs.image-tag }} -n admin
+
+      - name: Check uploader rollout
+        uses: actions-hub/kubectl@master
+        env:
+          KUBE_HOST: ${{ secrets.KUBE_HOST }}
+          KUBE_TOKEN: ${{ secrets.KUBE_TOKEN }}
+          KUBE_CERTIFICATE: ${{ secrets.KUBE_CA }}
+        with:
+          # Cold image pulls (browser runtime) can take several minutes on the home node.
+          args: rollout status deployment/terex-tiktok-uploader -n admin --timeout=600s
