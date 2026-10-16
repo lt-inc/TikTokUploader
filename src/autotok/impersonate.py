@@ -46,9 +46,11 @@ def sigv4_headers(method: str, url: str, *, service: str, region: str, access_ke
 
 
 def impersonated_get(url: str, *, headers: dict[str, str], cookies: dict[str, str],
-                     proxies: dict[str, str] | None, timeout: float):
+                     proxies: dict[str, str] | None, timeout: float | tuple[float, float],
+                     allow_redirects: bool = True):
     """GET with Chrome's TLS and HTTP/2 fingerprint. The result has status_code, text and json()."""
     from curl_cffi import requests as curl
 
     with curl.Session(impersonate=IMPERSONATE, trust_env=False) as session:
-        return session.get(url, headers=headers, cookies=cookies, proxies=proxies, timeout=timeout)
+        return session.get(url, headers=headers, cookies=cookies, proxies=proxies, timeout=timeout,
+                           allow_redirects=allow_redirects)
