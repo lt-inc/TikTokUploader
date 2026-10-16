@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from http.cookiejar import Cookie
 from urllib.parse import urlparse
 
+import logging
+
 import requests
+
+log = logging.getLogger("tiktok.identity")
 
 
 class SessionRejected(Exception):
@@ -58,13 +62,19 @@ def verify_identity(cookies: list[dict], user_agent: str, proxy: str | None = No
     with authenticated_session(cookies, user_agent, proxy) as session:
         response = session.get("https://www.tiktok.com/passport/web/account/info/", params={"aid": 1459}, timeout=(10, 20), allow_redirects=False)
         if response.status_code != 200:
+            log.warning("identity check rejected status=%s via_proxy=%s", response.status_code, bool(proxy))
             raise SessionRejected("TikTok did not accept the session; reconnect the account")
         try:
             body = response.json()
         except ValueError as exc:
+            log.warning("identity check returned a non-JSON page via_proxy=%s", bool(proxy))
             raise SessionRejected("TikTok requested browser verification; reconnect or open browser help") from exc
         data = body.get("data", {})
         if body.get("message") not in (None, "success") or not isinstance(data, dict):
+            # TikTok's own status fields only; never the cookies or the response body.
+            fields = data if isinstance(data, dict) else {}
+            log.warning("identity check not authenticated message=%r error_code=%r description=%r via_proxy=%s",
+                        str(body.get("message"))[:80], fields.get("error_code"), str(fields.get("description"))[:120], bool(proxy))
             raise SessionRejected("TikTok did not confirm an authenticated account")
         user = data.get("user", data.get("user_info", data))
         uid = user.get("user_id_str", user.get("user_id", user.get("uid")))
