@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Union
+from urllib.parse import urlencode
 
 import requests
 from requests_auth_aws_sigv4 import AWSSigV4
@@ -37,6 +38,7 @@ MAX_CAPTION_LENGTH = 2200
 MIN_SCHEDULE = timedelta(minutes=15)
 MAX_SCHEDULE = timedelta(days=10)
 CHUNK_SIZE = 5 * 1024 * 1024
+APPLY_CLIENT_BEST_HOSTS = ",".join(f"tos-{n}-up.tiktokcdn.com" for n in ("my216", "my16", "my319", "my316"))
 DEFAULT_DATACENTER = "useast2a"
 AID = 1988
 
@@ -327,12 +329,18 @@ class Client:
             ) from None
 
         file_size = path.stat().st_size
-        # TikTok Studio sends a fresh random base36 "s" per upload (observed in a
-        # browser HAR) plus device_platform=web. A constant "s" shared by every
-        # client is answered with CodeN 30411 "too many request".
+        # Mirror TikTok Studio's ApplyUploadInner (observed in a browser HAR): a fresh
+        # random base36 "s" per upload plus device_platform, business_tag,
+        # ClientBestHosts and X-Amz-Expires. The first two alone did not stop CodeN
+        # 30411 "too many request", so the remaining parameters are sent as well.
         nonce = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(11))
-        url = ("https://www.tiktok.com/top/v1?Action=ApplyUploadInner&Version=2020-11-19"
-               f"&SpaceName=tiktok&FileType=video&IsInner=1&FileSize={file_size}&s={nonce}&device_platform=web")
+        query = {
+            "Action": "ApplyUploadInner", "Version": "2020-11-19", "SpaceName": "tiktok", "FileType": "video",
+            "IsInner": "1", "ClientBestHosts": APPLY_CLIENT_BEST_HOSTS, "FileSize": file_size,
+            "X-Amz-Expires": "604800", "s": nonce, "device_platform": "web",
+            "business_tag": "tiktok_video_submission_web",
+        }
+        url = "https://www.tiktok.com/top/v1?" + urlencode(query, safe=",")
         apply = _json(self._request(session, "GET", url, "apply upload", auth=aws_auth), "apply upload")
         try:
             node = apply["Result"]["InnerUploadAddress"]["UploadNodes"][0]
