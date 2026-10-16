@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Union
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from requests_auth_aws_sigv4 import AWSSigV4
@@ -340,7 +340,10 @@ class Client:
             "X-Amz-Expires": "604800", "s": nonce, "device_platform": "web",
             "business_tag": "tiktok_video_submission_web",
         }
-        url = "https://www.tiktok.com/top/v1?" + urlencode(query, safe=",")
+        # requests-auth-aws-sigv4 signs the query values exactly as they appear in the
+        # URL, while the server canonicalizes them percent-encoded: a bare comma in
+        # ClientBestHosts gives SignatureDoesNotMatch, so it must be sent as %2C.
+        url = "https://www.tiktok.com/top/v1?" + urlencode(query, quote_via=quote)
         apply = _json(self._request(session, "GET", url, "apply upload", auth=aws_auth), "apply upload")
         try:
             node = apply["Result"]["InnerUploadAddress"]["UploadNodes"][0]
