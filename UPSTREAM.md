@@ -12,6 +12,10 @@ Browser session routing cookies are preserved without an invented datacenter.
 LT-Inc change (2026-10-16): ApplyUploadInner mirrors TikTok Studio's request: a fresh
 random `s` per upload (upstream: constant) plus `device_platform=web`,
 `business_tag=tiktok_video_submission_web`, `ClientBestHosts` and `X-Amz-Expires`.
+LT-Inc change (2026-10-16): ApplyUploadInner is sent with Studio's headers over a Chrome
+TLS/HTTP2 fingerprint (`curl_cffi`) and an own SigV4 signer (`autotok/impersonate.py`);
+upstream's plain `requests` call is answered with CodeN 30411. CommitUploadInner keeps
+the upstream `requests` signer.
 The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.

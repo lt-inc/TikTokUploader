@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import time
@@ -19,6 +20,7 @@ import requests
 from requests_auth_aws_sigv4 import AWSSigV4
 
 from . import settings
+from .impersonate import impersonated_get, sigv4_headers
 from .accounts import Account, AccountStore
 from .captions import build_caption, make_user_resolver
 from .errors import (
@@ -98,6 +100,26 @@ def _visibility(value) -> int:
         raise ValidationError("visibility must be 0/'public' or 1/'private'")
     return mapping[key]
 
+
+
+def _studio_headers(user_agent: str) -> dict[str, str]:
+    """Headers TikTok Studio's own fetch sends on ApplyUploadInner (from a browser HAR)."""
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/tiktokstudio/upload?from=creator_center&tab=video",
+        "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
+        "Priority": "u=1, i",
+    }
+    chrome = re.search(r"Chrome/(\d+)", user_agent or "")
+    if chrome:  # client hints are sent by Chromium browsers only
+        major = chrome.group(1)
+        platform = "macOS" if "Macintosh" in user_agent else "Windows" if "Windows" in user_agent else "Linux"
+        headers.update({
+            "Sec-CH-UA": f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not(A:Brand";v="24"',
+            "Sec-CH-UA-Mobile": "?0", "Sec-CH-UA-Platform": f'"{platform}"',
+        })
+    return headers
 
 def _crc32(data: bytes) -> str:
     return format(zlib.crc32(data) & 0xFFFFFFFF, "08x")
@@ -181,6 +203,23 @@ class Client:
             raise UploadError(f"{what}: network error: {exc}") from exc
         if expect_ok and r.status_code != 200:
             raise UploadError(f"{what}: HTTP {r.status_code}", status=r.status_code, body=r.text[:500])
+        return r
+
+    def _apply_request(self, session: requests.Session, url: str, credentials: dict[str, str]):
+        """ApplyUploadInner over a Chrome TLS/HTTP2 fingerprint; plain requests is answered with 30411."""
+        self._guard()
+        headers = {
+            **_studio_headers(self.user_agent), "User-Agent": self.user_agent,
+            **sigv4_headers("GET", url, service="vod", region="ap-singapore-1", **credentials),
+        }
+        cookies = {c.name: c.value for c in session.cookies if c.domain.lstrip(".").endswith("tiktok.com")}
+        try:
+            r = impersonated_get(url, headers=headers, cookies=cookies,
+                                 proxies=self.proxy.for_requests() if self.proxy else None, timeout=self.timeout)
+        except Exception as exc:  # curl_cffi raises its own RequestException hierarchy
+            raise UploadError(f"apply upload: network error: {type(exc).__name__}") from exc
+        if r.status_code != 200:
+            raise UploadError(f"apply upload: HTTP {r.status_code}", status=r.status_code, body=r.text[:500])
         return r
 
     def check_session(self) -> bool:
@@ -315,13 +354,15 @@ class Client:
                                    "upload auth"), "upload auth")
         try:
             token = auth["video_token_v5"]
-            aws_auth = AWSSigV4(
-                "vod",
-                region="ap-singapore-1",
-                aws_access_key_id=token["access_key_id"],
-                aws_secret_access_key=token["secret_acess_key"],  # sic: TikTok's spelling
-                aws_session_token=token["session_token"],
-            )
+            credentials = {
+                "access_key": token["access_key_id"],
+                "secret_key": token["secret_acess_key"],  # sic: TikTok's spelling
+                "session_token": token["session_token"],
+            }
+            # CommitUploadInner is a POST with a body; it keeps the requests-based signer.
+            aws_auth = AWSSigV4("vod", region="ap-singapore-1", aws_access_key_id=credentials["access_key"],
+                                aws_secret_access_key=credentials["secret_key"],
+                                aws_session_token=credentials["session_token"])
         except (KeyError, TypeError):
             raise NotLoggedInError(
                 f"TikTok rejected the session for '{self.account.name}'. Log in again: "
@@ -340,11 +381,8 @@ class Client:
             "X-Amz-Expires": "604800", "s": nonce, "device_platform": "web",
             "business_tag": "tiktok_video_submission_web",
         }
-        # requests-auth-aws-sigv4 signs the query values exactly as they appear in the
-        # URL, while the server canonicalizes them percent-encoded: a bare comma in
-        # ClientBestHosts gives SignatureDoesNotMatch, so it must be sent as %2C.
         url = "https://www.tiktok.com/top/v1?" + urlencode(query, quote_via=quote)
-        apply = _json(self._request(session, "GET", url, "apply upload", auth=aws_auth), "apply upload")
+        apply = _json(self._apply_request(session, url, credentials), "apply upload")
         try:
             node = apply["Result"]["InnerUploadAddress"]["UploadNodes"][0]
             video_id = node["Vid"]

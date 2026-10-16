@@ -12,7 +12,7 @@ dependencies = [
   "fastapi==0.115.12", "uvicorn[standard]==0.34.2", "httpx==0.28.1",
   "cryptography==44.0.2", "pika==1.3.2", "requests[socks]==2.32.3",
   "requests-auth-aws-sigv4==0.7", "phantomwright==0.2.0",
-  "phantomwright-driver==1.58.3", "Pillow==11.2.1", "prometheus-client==0.21.1",
+  "phantomwright-driver==1.58.3", "curl_cffi==0.16.3", "Pillow==11.2.1", "prometheus-client==0.21.1",
 ]
 
 [project.optional-dependencies]
