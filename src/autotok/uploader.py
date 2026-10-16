@@ -327,8 +327,12 @@ class Client:
             ) from None
 
         file_size = path.stat().st_size
+        # TikTok Studio sends a fresh random base36 "s" per upload (observed in a
+        # browser HAR) plus device_platform=web. A constant "s" shared by every
+        # client is answered with CodeN 30411 "too many request".
+        nonce = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(11))
         url = ("https://www.tiktok.com/top/v1?Action=ApplyUploadInner&Version=2020-11-19"
-               f"&SpaceName=tiktok&FileType=video&IsInner=1&FileSize={file_size}&s=g158iqx8434")
+               f"&SpaceName=tiktok&FileType=video&IsInner=1&FileSize={file_size}&s={nonce}&device_platform=web")
         apply = _json(self._request(session, "GET", url, "apply upload", auth=aws_auth), "apply upload")
         try:
             node = apply["Result"]["InnerUploadAddress"]["UploadNodes"][0]
