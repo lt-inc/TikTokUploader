@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pika
 from autotok import Account, Client
-from autotok.errors import AutotokError, NotLoggedInError, PublishError, PublishUncertainError
+from autotok.errors import AutotokError, NotLoggedInError, PublishError, PublishUncertainError, UploadError
 from autotok.uploader import _creation_id
 
 from .browser import browser_permit
@@ -30,6 +30,15 @@ from .ownership import ProcessOwnership
 
 log = logging.getLogger("tiktok.worker")
 QUEUE = "tiktok.workflow.v1.publish"
+RATE_LIMIT_BACKOFF = 30 * 60
+
+
+def is_rate_limited(exc: Exception) -> bool:
+    """TikTok vod answers ApplyUploadInner with CodeN 30411 "too many request"."""
+    if not isinstance(exc, UploadError):
+        return False
+    body = exc.body or ""
+    return '"CodeN": 30411' in body or "too many request" in body.lower()
 
 
 class Worker:
@@ -80,9 +89,12 @@ class Worker:
         lease.checkpoint(state, checkpoint, final_request_started=submitting)
         log.info("publishing stage", extra={"publication_id": journal["publication_id"], "attempt_id": journal["attempt_id"], "phase": state})
 
-    def _failure(self, lease: Lease, state: str, code: str, message: str, retryable=False, reconnect_required=False):
-        response = self.main.call("fail", {**lease.fields, "state": state, "code": code, "error_code": code,
-            "error": message, "message": message, "retryable": retryable, "reconnect_required": reconnect_required})
+    def _failure(self, lease: Lease, state: str, code: str, message: str, retryable=False, reconnect_required=False, retry_after_seconds=0):
+        payload = {**lease.fields, "state": state, "code": code, "error_code": code,
+            "error": message, "message": message, "retryable": retryable, "reconnect_required": reconnect_required}
+        if retry_after_seconds:
+            payload["retry_after_seconds"] = retry_after_seconds
+        response = self.main.call("fail", payload)
         if response.get("accepted") is False:
             raise Fenced("Terex rejected the failure report")
 
@@ -255,6 +267,12 @@ class Worker:
             if external_started or journal.get("phase") in ("submitting", "accepted"):
                 self._failure(lease, "needs_attention", "upload_unknown", "The final publication result is uncertain. Check the post; automatic upload retry is blocked.")
                 UPLOADS.labels("uncertain").inc()
+            elif is_rate_limited(exc):
+                # TikTok's vod service throttles the egress IP/account. Retrying
+                # every minute only prolongs the limit, so ask Terex to wait.
+                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok temporarily limited uploads (too many requests). Wait before retrying; consider a dedicated proxy for this account.",
+                              retryable=True, retry_after_seconds=RATE_LIMIT_BACKOFF)
+                UPLOADS.labels("rate_limited").inc()
             else:
                 self._failure(lease, "failed", "upload_preflight_failed", "Preparation/transfer failed before publication; safe to retry.", retryable=True)
                 UPLOADS.labels("preflight_failed").inc()
