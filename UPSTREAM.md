@@ -9,8 +9,9 @@ and final submission; durable barrier/cancellation guard; classify ambiguous
 server responses; pinned Phantomwright browser runtime; Terex caption preparation
 keeps email addresses and @names as plain text without a verified mention mapping.
 Browser session routing cookies are preserved without an invented datacenter.
-LT-Inc change (2026-10-16): ApplyUploadInner uses a fresh random `s` per upload and
-`device_platform=web`, as observed in TikTok Studio, instead of upstream's constant `s`.
+LT-Inc change (2026-10-16): ApplyUploadInner mirrors TikTok Studio's request: a fresh
+random `s` per upload (upstream: constant) plus `device_platform=web`,
+`business_tag=tiktok_video_submission_web`, `ClientBestHosts` and `X-Amz-Expires`.
 The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.
