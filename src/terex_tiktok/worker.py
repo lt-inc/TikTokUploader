@@ -2,31 +2,34 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import tempfile
 import threading
 import time
 import uuid
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import pika
 from autotok import Account, Client
-from autotok.errors import AutotokError, NotLoggedInError, PublishError, PublishUncertainError, UploadError
+from autotok.errors import NotLoggedInError, PublishError, UploadError
 from autotok.uploader import _creation_id
 
 from .browser import browser_permit
 from .config import Config
 from .connections import Connections, iso_now
-from .identity import SessionRejected, verify_identity
+from .identity import SessionRejected, checked_cookies, verify_identity
 from .main_client import Fenced, Lease, MainClient
 from .media import download_media
 from .metrics import ACTIVE, BROKER, STAGES, TRANSFER, UPLOADS
 from .reconcile import inspect_posts, response_post_ids
 from .store import EncryptedStore
 from .ownership import ProcessOwnership
+from .studio import BrowserStudioClient
 
 log = logging.getLogger("tiktok.worker")
 QUEUE = "tiktok.workflow.v1.publish"
@@ -34,11 +37,8 @@ RATE_LIMIT_BACKOFF = 30 * 60
 
 
 def is_rate_limited(exc: Exception) -> bool:
-    """TikTok vod answers ApplyUploadInner with CodeN 30411 "too many request"."""
-    if not isinstance(exc, UploadError):
-        return False
-    body = exc.body or ""
-    return '"CodeN": 30411' in body or "too many request" in body.lower()
+    """HTTP throttling and the upload gateway's application-level refusal."""
+    return isinstance(exc, UploadError) and exc.rate_limited
 
 
 class Worker:
@@ -183,15 +183,29 @@ class Worker:
             # physical work. Lost Claim responses leave no orphan operation.
             self._checkpoint(lease, journal, "uploading")
             row = self.connections.require(journal["account_id"], journal["session_version"], journal["remote_account_id"])
-            identity = verify_identity(row["cookies"], row["user_agent"], self.config.proxy_url)
-            if identity.remote_account_id != journal["remote_account_id"]:
-                raise SessionRejected("TikTok returned a different account identity")
+            cooldown = self.store.get("upload-cooldown", journal["account_id"]) or {}
+            remaining = (max(0, math.ceil(cooldown.get("not_before", 0) - time.time()))
+                         if cooldown.get("remote_account_id") == journal["remote_account_id"] else 0)
+            if remaining:
+                # The wait belongs to the account, so another queued video must
+                # not immediately hit TikTok or extend the original cooldown.
+                self._failure(lease, "retry_wait", "tiktok_account_cooldown", "TikTok uploads for this account are paused after a rate-limit response.",
+                              retryable=True, retry_after_seconds=remaining)
+                UPLOADS.labels("rate_limited").inc()
+                return
+            studio = self.config.upload_mode == "studio"
+            if not studio:
+                identity = verify_identity(row["cookies"], row["user_agent"], self.config.proxy_url)
+                if identity.remote_account_id != journal["remote_account_id"]:
+                    raise SessionRejected("TikTok returned a different account identity")
             with tempfile.TemporaryDirectory(prefix="publish-", dir=self.config.scratch_dir) as tmp:
                 path = Path(tmp) / "video.mp4"
                 with STAGES.labels("download").time():
                     size = download_media(publication["media_url"], publication["media_sha256"], path, self.config, guard)
                 account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=self.config.proxy_url)
-                uploader = Client(account, timeout=20, guard=guard)
+                uploader = (BrowserStudioClient(account, timeout=20, guard=guard,
+                                               expected_remote_account_id=journal["remote_account_id"])
+                            if studio else Client(account, timeout=20, guard=guard))
                 with STAGES.labels("prepare").time():
                     prepared = uploader.prepare(path, journal["caption"], creation_id=journal["creation_id"], visibility=publication.get("visibility", "private"))
                     journal["phase"] = "prepared"
@@ -203,17 +217,24 @@ class Worker:
                     self.store.put("publication", publication_id, journal)
                     self._checkpoint(lease, journal, "uploading")
                     TRANSFER.labels("upload").inc(size)
-                if self.browser_help:
+                if self.browser_help and not studio:
                     # Keep the transferred project while the operator solves
                     # any device/CAPTCHA check in this very browser.
                     row = self.browser_help.verify_for_publish(row, guard, lambda: self._checkpoint(lease, journal, "processing"))
                     for cookie in row["cookies"]:
                         prepared["session"].cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path", "/"))
-                with STAGES.labels("prepare_publish").time(), browser_permit():
+                with STAGES.labels("prepare_publish").time(), (nullcontext() if studio else browser_permit()):
                     uploader.prepare_publish(prepared)
                 def barrier():
                     nonlocal external_started
                     guard()
+                    if studio:
+                        # Studio creates its own project. The route gate reads
+                        # its native payload before allowing the actual POST.
+                        creation_id = prepared.get("creation_id")
+                        if not isinstance(creation_id, str) or not creation_id:
+                            raise ValueError("Studio did not identify the project before publication")
+                        journal["creation_id"] = creation_id
                     journal.update(phase="submitting", submitted_at=time.time())
                     # Local journal protects response loss while the main-be
                     # durable acknowledgement fences the actual send.
@@ -224,6 +245,17 @@ class Worker:
                     response = uploader.submit(prepared, barrier)
                 journal.update(phase="accepted", post_ids=sorted(response_post_ids(response)))
                 self.store.put("publication", publication_id, journal)
+                if studio:
+                    try:
+                        cookies = checked_cookies(prepared["session"].export_cookies())
+                        with self.store.lock:
+                            row = self.connections.require(journal["account_id"], journal["session_version"], journal["remote_account_id"])
+                            row["cookies"] = cookies
+                            self.store.put("account", journal["account_id"], row)
+                    finally:
+                        # Reconciliation opens its own browser and acquires the
+                        # same permit; release the upload browser first.
+                        prepared["session"].close()
                 self._checkpoint(lease, journal, "verifying", submitting=True)
                 with STAGES.labels("verify").time():
                     proof = inspect_posts(row, journal, self.config.proxy_url, guard)
@@ -268,23 +300,38 @@ class Worker:
                 self._failure(lease, "needs_attention", "upload_unknown", "The final publication result is uncertain. Check the post; automatic upload retry is blocked.")
                 UPLOADS.labels("uncertain").inc()
             elif is_rate_limited(exc):
-                # TikTok's vod service throttles the egress IP/account. Retrying
-                # every minute only prolongs the limit, so ask Terex to wait.
-                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok temporarily limited uploads (too many requests). Wait before retrying; consider a dedicated proxy for this account.",
-                              retryable=True, retry_after_seconds=RATE_LIMIT_BACKOFF)
+                delay = max(RATE_LIMIT_BACKOFF, exc.retry_after_seconds)
+                with self.store.lock:
+                    cooldown = self.store.get("upload-cooldown", journal["account_id"]) or {}
+                    until = time.time() + delay
+                    if cooldown.get("remote_account_id") == journal["remote_account_id"]:
+                        until = max(cooldown.get("not_before", 0), until)
+                    # Separate encrypted state survives reconnects and cannot
+                    # overwrite account/session fields changed concurrently.
+                    self.store.put("upload-cooldown", journal["account_id"],
+                                   {"remote_account_id": journal["remote_account_id"], "not_before": until})
+                # CodeN 30411 can also be a web-client refusal; a longer wait
+                # controls retries but does not establish the underlying cause.
+                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload with a rate-limit response. Uploads for this account are paused before another attempt.",
+                              retryable=True, retry_after_seconds=delay)
                 UPLOADS.labels("rate_limited").inc()
             else:
                 self._failure(lease, "failed", "upload_preflight_failed", "Preparation/transfer failed before publication; safe to retry.", retryable=True)
                 UPLOADS.labels("preflight_failed").inc()
-            # Only TikTok-facing autotok errors carry a diagnostic safe to log:
-            # a step name, HTTP status and a short response excerpt, never cookies.
+            # Upload bodies and exception text can include temporary credentials
+            # or proxy details; log only bounded diagnostic fields.
             detail = ""
-            if isinstance(exc, AutotokError):
-                detail = f" detail={str(exc)[:300]!r} status={getattr(exc, 'status', None)} body={(getattr(exc, 'body', None) or '')[:500]!r}"
+            if isinstance(exc, UploadError):
+                detail = f" stage={exc.stage!r} status={exc.status} provider_code={exc.provider_code} retry_after_seconds={exc.retry_after_seconds}"
             log.warning("upload failed publication_id=%s attempt_id=%s phase=%s error_type=%s%s", publication_id, claim["attempt_id"], journal["phase"], type(exc).__name__, detail)
         finally:
             if prepared:
-                prepared["session"].close()
+                try:
+                    prepared["session"].close()
+                except Exception as exc:
+                    # A disconnected browser may raise while closing. Its
+                    # transport cleanup must not strand the lease/operation.
+                    log.warning("upload session cleanup failed error_type=%s", type(exc).__name__)
             lease.close()
             ACTIVE.dec()
             log.info("publishing operation ended", extra={"publication_id": publication_id, "attempt_id": claim["attempt_id"], "phase": journal["phase"], "duration_ms": round((time.monotonic() - started) * 1000)})

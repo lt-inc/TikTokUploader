@@ -16,6 +16,16 @@ LT-Inc change (2026-10-16): ApplyUploadInner is sent with Studio's headers over 
 TLS/HTTP2 fingerprint (`curl_cffi`) and an own SigV4 signer (`autotok/impersonate.py`);
 upstream's plain `requests` call is answered with CodeN 30411. CommitUploadInner keeps
 the upstream `requests` signer.
+LT-Inc change (2026-10-27): preserve the scoped upload cookie jar, including
+server-side cookie rotation/deletion, across requests and curl_cffi; do not
+follow redirects on the signed ApplyUploadInner request. Preserve structured
+upload error codes and Retry-After timing without logging response bodies or
+network exception text. The worker applies a durable per-account cooldown only
+before the final submission; uncertain results remain fenced from repeat sends.
+LT-Inc change (2026-10-27): add an independent, optional local Studio UI backend
+in `terex_tiktok/studio.py`. The site performs upload/signing; a request gate
+validates metadata, checkpoints the native creation ID and permits one publish
+request. Existing worker ownership, session fencing and post reconciliation apply.
 The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.

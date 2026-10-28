@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from datetime import datetime, timezone
+from http.cookiejar import CookieJar
 from urllib.parse import parse_qsl, quote, urlsplit
 
 IMPERSONATE = "chrome"  # curl_cffi alias for its newest Chrome profile
@@ -45,12 +46,17 @@ def sigv4_headers(method: str, url: str, *, service: str, region: str, access_ke
     }
 
 
-def impersonated_get(url: str, *, headers: dict[str, str], cookies: dict[str, str],
+def impersonated_get(url: str, *, headers: dict[str, str], cookies: CookieJar | dict[str, str],
                      proxies: dict[str, str] | None, timeout: float | tuple[float, float],
                      allow_redirects: bool = True):
-    """GET with Chrome's TLS and HTTP/2 fingerprint. The result has status_code, text and json()."""
+    """GET with Chrome's TLS/HTTP2 fingerprint and the caller's scoped cookies.
+
+    curl_cffi shares a supplied CookieJar with its session. This preserves
+    same-name cookies on different paths/domains and applies accepted Set-Cookie
+    changes (including expiry/deletion) to subsequent requests by the caller.
+    """
     from curl_cffi import requests as curl
 
-    with curl.Session(impersonate=IMPERSONATE, trust_env=False) as session:
-        return session.get(url, headers=headers, cookies=cookies, proxies=proxies, timeout=timeout,
+    with curl.Session(impersonate=IMPERSONATE, trust_env=False, cookies=cookies) as session:
+        return session.get(url, headers=headers, proxies=proxies, timeout=timeout,
                            allow_redirects=allow_redirects)
