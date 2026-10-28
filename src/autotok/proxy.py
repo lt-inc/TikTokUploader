@@ -153,6 +153,9 @@ def proxied_session(proxy: "str | Proxy | None"):
             return super().request(method, url, **kwargs)
 
     s = _ProxiedSession()
+    # The selected account route also applies when it explicitly disables a
+    # proxy. Ambient HTTP_PROXY/HTTPS_PROXY must not silently change that route.
+    s.trust_env = False
     if pinned:
         s.proxies.update(pinned)
     return s

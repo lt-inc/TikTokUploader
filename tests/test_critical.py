@@ -4,6 +4,7 @@ import time
 import json
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from dataclasses import replace
 
 import pytest
 import httpx
@@ -20,6 +21,7 @@ from terex_tiktok.store import EncryptedStore
 from terex_tiktok.worker import Worker
 from terex_tiktok.app import create_app
 from terex_tiktok.ownership import ProcessOwnership
+from terex_tiktok.browser import browser_permit
 
 
 def config(tmp_path):
@@ -145,9 +147,10 @@ def test_media_id_is_not_post_id_and_ambiguous_match_is_not_success():
                          {**journal, "post_ids": [], "creation_id": "exact-creation"})["remote_id"] == "999"
 
 
-def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monkeypatch):
+@pytest.mark.parametrize("upload_mode", ["http", "studio"])
+def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monkeypatch, upload_mode):
     """Go int64 IDs/complete state and Python verify DTO cross the HTTP boundary."""
-    cfg = config(tmp_path)
+    cfg = replace(config(tmp_path), upload_mode=upload_mode)
     cfg.scratch_dir.mkdir()
     store = EncryptedStore(cfg.state_dir, cfg.encryption_key)
     connections = Connections(store, cfg)
@@ -172,6 +175,8 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
             assert type(payload["expected_version"]) is int
             if payload["state"] == "publishing":
                 assert payload["final_request_started"] is True
+                if upload_mode == "studio":
+                    assert payload["provider_checkpoint"]["creation_id"] == "studio-native-project"
             return httpx.Response(200, json={"accepted": True})
         if operation == "complete":
             assert payload["state"] == "published" and payload["final_request_started"] is True
@@ -186,20 +191,45 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
         pytest.fail(f"unexpected operation {operation}")
     worker.main.client.close()
     worker.main.client = httpx.Client(base_url="http://main", transport=httpx.MockTransport(main_http))
+    class BrowserSession:
+        def __init__(self):
+            self.permit = browser_permit(timeout=0)
+            self.permit.__enter__()
+            self.closed = False
+        def close(self):
+            if not self.closed:
+                self.permit.__exit__(None, None, None)
+                self.closed = True
+        def export_cookies(self):
+            return cookies("studio-renewed-session")
     class Provider:
-        def __init__(self, *args, **kwargs): pass
-        def prepare(self, *args, **kwargs): return {"session": SimpleNamespace(close=lambda: None)}
+        def __init__(self, *args, **kwargs):
+            if upload_mode == "studio":
+                assert kwargs["expected_remote_account_id"] == "100"
+        def prepare(self, *args, **kwargs):
+            return {"session": BrowserSession() if upload_mode == "studio" else SimpleNamespace(close=lambda: None)}
         def transfer(self, prepared): return "media-123"
         def prepare_publish(self, prepared): pass
         def submit(self, prepared, before_send):
+            prepared["creation_id"] = "studio-native-project"
             before_send()
             return {"aweme_id": "999"}
     monkeypatch.setattr("terex_tiktok.worker.Client", Provider)
-    monkeypatch.setattr("terex_tiktok.worker.verify_identity", lambda *args: Identity("100", "alice", "Alice"))
+    monkeypatch.setattr("terex_tiktok.worker.BrowserStudioClient", Provider)
+    def verify(*args):
+        assert upload_mode == "http", "Studio verifies identity inside its own browser context"
+        return Identity("100", "alice", "Alice")
+    monkeypatch.setattr("terex_tiktok.worker.verify_identity", verify)
     monkeypatch.setattr("terex_tiktok.worker.download_media", lambda *args: 4)
     proof = {"remote_id": "999", "remote_url": "https://www.tiktok.com/@alice/video/999", "verified_at": expiry,
              "proof": "authenticated_studio_item"}
-    monkeypatch.setattr("terex_tiktok.worker.inspect_posts", lambda *args: proof)
+    def inspect(row, *args):
+        # Studio must release the browser gate before reconciliation opens it.
+        with browser_permit(timeout=0):
+            if upload_mode == "studio":
+                assert row["cookies"][0]["value"] == "studio-renewed-session"
+            return proof
+    monkeypatch.setattr("terex_tiktok.worker.inspect_posts", inspect)
     worker.execute({"publication_id": 12, "attempt_id": "attempt-1", "expected_version": 2})
     assert seen == ["claim", "checkpoint", "checkpoint", "checkpoint", "checkpoint", "checkpoint", "complete", "release"]
     journal = store.get("publication", 12)

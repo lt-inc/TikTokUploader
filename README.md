@@ -42,7 +42,7 @@ Caption is required and is limited to 2,200 characters. Private/public are
 supported; music search, custom covers and platform-specific long compilations
 are not part of this pilot.
 
-Execution: Claim → identity/SHA check → prepare → 5 MiB sequential HTTP transfer
+Default HTTP execution: Claim → identity/SHA check → prepare → 5 MiB sequential HTTP transfer
 → persist media ID → prepare final request → durable Terex checkpoint immediately
 before final POST → verify the actual post → Complete. One worker and one browser
 permit keep resource use bounded. Lease renewals run every twenty seconds. An
@@ -57,6 +57,40 @@ evidence stays **needs attention**. Check TikTok and use Terex's reconciliation
 action. An absent post in a single list response is not proof that retry is safe.
 Only an explicit operator confirmation of absence may authorize a new publication
 version for retry; old broker messages and automatic attempts cannot clear uncertainty.
+
+Before submission, HTTP 429 from upload endpoints and ApplyUploadInner's
+`CodeN=30411` pause uploads
+for the account for at least thirty minutes, or longer when `Retry-After` asks
+for it. The encrypted cooldown survives worker restarts and prevents other queued
+videos from immediately contacting TikTok. A rate-limit response after the final
+send never authorizes an automatic repeat. `30411` alone does not establish
+whether the cause is frequency, the account, the network route or web-client
+compatibility. See [upload diagnosis and alternatives](docs/UPLOAD-DIAGNOSIS.ru.md).
+Deploy the companion Terex change that recognizes `tiktok_account_cooldown` as a
+deferral before this worker: waiting for another video's cooldown must not use
+up the publication's failure budget. Actual TikTok refusals still use that budget.
+
+### Experimental local Studio browser mode
+
+Set `TIKTOK_UPLOAD_MODE=studio` to use the existing local Phantomwright/Chromium
+runtime for the whole upload form. The default remains `http`. Studio's own
+JavaScript transfers the video and constructs the publication request; no paid
+browser service, third-party posting API or TikTok developer app is required.
+
+The worker imports the verified account's cookies, selects the video, fills the
+caption and explicitly selects public/private. It observes the actual upload
+IDs, then validates the native publish payload before allowing one final POST.
+The durable Terex checkpoint runs in the browser request gate immediately before
+that send. Browser retries cannot issue a second final POST. The browser-generated
+creation ID replaces the HTTP worker's local project ID before the checkpoint.
+The browser is closed before the normal authenticated post reconciliation.
+
+This mode is a stage pilot, not a verified TikTok workaround. UI/protocol changes,
+unexpected dialogs, missing upload IDs or mismatched privacy stop the attempt.
+Login/challenge screens require the existing Browser verification flow before
+another pre-submit attempt. There is no automatic switch between transports after
+an uncertain result. Confirm one private post and its visibility before testing
+public reach. Both modes respect the same account cooldown and final-send fence.
 
 ## Stage deployment and secrets
 
@@ -94,7 +128,21 @@ download is bounded to 512 MiB (`TIKTOK_MAX_MEDIA_BYTES`) and five minutes, with
 SHA-256 verification and at least two GiB of spare temporary disk space. Whole
 attempt deadline is fifteen minutes. Persistent state is never scratch cleanup.
 
-Optional: `TIKTOK_PROXY_URL` for the account's consistent connection route.
+Optional: `TIKTOK_PROXY_URL` is the server's default TikTok route. Each account's
+Terex panel can select **server default**, **direct (no proxy)** or **custom
+proxy**. The custom URL is encrypted with the session state and is never returned
+to the panel; only its scheme/host/port and a configured flag are exposed. Turning
+it off preserves the encrypted URL for later reuse. Direct mode also ignores
+ambient HTTP(S) proxy variables for TikTok HTTP requests. Identity, browser,
+upload and reconciliation operations all use the selected account route.
+
+Save the route before reconnecting or opening Browser verification. A route
+change increments the session version and fences an in-progress attempt before
+another send; an already submitted post remains subject to reconciliation.
+Check the session after changing the route, or reconnect the same account if
+TikTok requires it. This setting controls the uploader and its helper browser;
+your local Chrome/Edge connection is configured separately.
+
 `TIKTOK_CAPTCHA_API_KEY`, `TIKTOK_CAPTCHA_MODEL_ID`, and
 `TIKTOK_CAPTCHA_OBJECT_MODEL_ID` configure **your own** Roboflow credentials/models.
 No API keys or weights are bundled. The model helper supports only recognized
@@ -117,10 +165,15 @@ not logged. `/source` identifies the servicing revision and corresponding source
 
 ## Local verification
 
-Install `.[test]`, then run `python -m compileall -q src` and `pytest -q`. The five
+Install `.[test]`, then run `python -m compileall -q src` and `pytest -q`. The
 critical checks cover account identity/single-use pairing and encryption, the
 durable final-send barrier/expiry, unknown-result redelivery, post verification,
-and the actual Go/Python HTTP ID/completion/release contract.
+the actual Go/Python HTTP ID/completion/release contract, session continuity
+across the upload clients, and account cooldown without repeating a final send.
+After installing Chromium with `phantomwright_driver install chromium`, run
+`TIKTOK_STUDIO_BROWSER_TESTS=1 pytest -q` to include real local-browser fixtures.
+They exercise the Studio form, identity mismatch, rejected checkpoints and
+blocked preparation/publication redirects without contacting TikTok.
 The production Docker build installs pinned Phantomwright 0.2.0 and driver 1.58.3,
 Chromium, Xvfb and the operator helper. It requires a running Linux Docker daemon.
 

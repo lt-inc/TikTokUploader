@@ -13,6 +13,7 @@ from .captcha import CaptchaProvider
 from .connections import Connections
 from .identity import SessionRejected, checked_cookies, verify_identity
 from .metrics import HELP
+from .routing import proxy_for
 
 
 class BrowserHelp:
@@ -69,7 +70,7 @@ class BrowserHelp:
         signal finish/stop; they never call Playwright on a foreign thread.
         """
         with browser_permit(), sync_playwright() as pw:
-            browser, context = open_context(pw, row, self.config.proxy_url, headless=False)
+            browser, context = open_context(pw, row, proxy_for(row, self.config), headless=False)
             token = None
             try:
                 guard()
@@ -103,7 +104,7 @@ class BrowserHelp:
                         raise SessionRejected("Complete the TikTok verification before publishing")
                 guard()
                 cookies = checked_cookies(context.cookies())
-                identity = verify_identity(cookies, row["user_agent"], self.config.proxy_url)
+                identity = verify_identity(cookies, row["user_agent"], proxy_for(row, self.config))
                 if identity.remote_account_id != row["remote_account_id"]:
                     raise SessionRejected("A different TikTok account is logged in")
                 with self.connections.store.lock:
@@ -136,7 +137,7 @@ class BrowserHelp:
         try:
             with browser_permit(), sync_playwright() as pw:
                 HELP.inc()
-                browser, context = open_context(pw, row, self.config.proxy_url, headless=False)
+                browser, context = open_context(pw, row, proxy_for(row, self.config), headless=False)
                 try:
                     page = context.new_page()
                     page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded", timeout=30000)
@@ -151,7 +152,7 @@ class BrowserHelp:
                         if session["finish"].is_set():
                             cookies = checked_cookies(context.cookies())
                             agent = page.evaluate("navigator.userAgent")
-                            identity = verify_identity(cookies, agent, self.config.proxy_url)
+                            identity = verify_identity(cookies, agent, proxy_for(row, self.config))
                             self.connections.accept(session["account_id"], cookies, agent, identity, session["version"], session["pairing_generation"])
                             session["status"] = "completed"
                             break

@@ -200,9 +200,9 @@ class Client:
         try:
             r = session.request(method, url, timeout=timeout or self.timeout, **kwargs)
         except requests.RequestException as exc:
-            raise UploadError(f"{what}: network error: {exc}") from exc
+            raise UploadError(f"{what}: network error: {type(exc).__name__}", stage=what) from exc
         if expect_ok and r.status_code != 200:
-            raise UploadError(f"{what}: HTTP {r.status_code}", status=r.status_code, body=r.text[:500])
+            raise UploadError.from_response(what, r)
         return r
 
     def _apply_request(self, session: requests.Session, url: str, credentials: dict[str, str]):
@@ -212,14 +212,14 @@ class Client:
             **_studio_headers(self.user_agent), "User-Agent": self.user_agent,
             **sigv4_headers("GET", url, service="vod", region="ap-singapore-1", **credentials),
         }
-        cookies = {c.name: c.value for c in session.cookies if c.domain.lstrip(".").endswith("tiktok.com")}
         try:
-            r = impersonated_get(url, headers=headers, cookies=cookies,
-                                 proxies=self.proxy.for_requests() if self.proxy else None, timeout=self.timeout)
+            r = impersonated_get(url, headers=headers, cookies=session.cookies,
+                                 proxies=self.proxy.for_requests() if self.proxy else None,
+                                 timeout=self.timeout, allow_redirects=False)
         except Exception as exc:  # curl_cffi raises its own RequestException hierarchy
-            raise UploadError(f"apply upload: network error: {type(exc).__name__}") from exc
+            raise UploadError(f"apply upload: network error: {type(exc).__name__}", stage="apply upload") from exc
         if r.status_code != 200:
-            raise UploadError(f"apply upload: HTTP {r.status_code}", status=r.status_code, body=r.text[:500])
+            raise UploadError.from_response("apply upload", r)
         return r
 
     def check_session(self) -> bool:
@@ -382,7 +382,8 @@ class Client:
             "business_tag": "tiktok_video_submission_web",
         }
         url = "https://www.tiktok.com/top/v1?" + urlencode(query, quote_via=quote)
-        apply = _json(self._apply_request(session, url, credentials), "apply upload")
+        response = self._apply_request(session, url, credentials)
+        apply = _json(response, "apply upload")
         try:
             node = apply["Result"]["InnerUploadAddress"]["UploadNodes"][0]
             video_id = node["Vid"]
@@ -390,8 +391,7 @@ class Client:
             store_uri, store_auth = store["StoreUri"], store["Auth"]
             upload_host, session_key = node["UploadHost"], node["SessionKey"]
         except (KeyError, IndexError, TypeError):
-            raise UploadError("apply upload: unexpected response from TikTok",
-                              body=json.dumps(apply)[:500]) from None
+            raise UploadError.from_response("apply upload", response, payload=apply) from None
 
         upload_id = str(uuid.uuid4())
         crcs: list[str] = []

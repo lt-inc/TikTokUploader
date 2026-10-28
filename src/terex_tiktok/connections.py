@@ -8,6 +8,7 @@ from typing import Callable
 from .config import Config
 from .identity import Identity, SessionRejected, checked_cookies, verify_identity
 from .store import EncryptedStore
+from .routing import normalized_proxy, proxy_for, proxy_public
 
 
 def iso_now() -> str:
@@ -61,11 +62,18 @@ class Connections:
         if not cookies or not agent:
             return self.public(row)
         try:
-            identity = self.verify(cookies, agent, self.config.proxy_url)
+            identity = self.verify(cookies, agent, proxy_for(row, self.config))
         except SessionRejected as exc:
-            row.update(status="needs_reauth", error=str(exc))
-            self.store.put("account", account_id, row)
-            return self.public(row)
+            with self.store.lock:
+                current = self.store.get("account", account_id)
+                if not current:
+                    raise ValueError("Account connection was removed") from None
+                if (current.get("session_version", 0) != row.get("session_version", 0)
+                        or current.get("pairing_generation", 0) != row.get("pairing_generation", 0)):
+                    return self.public(current)
+                current.update(status="needs_reauth", error=str(exc))
+                self.store.put("account", account_id, current)
+                return self.public(current)
         # A connection exported from the extension may need server-side browser
         # verification; preserve its encrypted payload for the helper, not logs.
         return self.accept(account_id, cookies, agent, identity, row.get("session_version", 0), row.get("pairing_generation", 0))
@@ -102,8 +110,28 @@ class Connections:
     def disconnect(self, account_id: int) -> dict:
         with self.store.lock:
             row = self.store.get("account", account_id) or {"account_id": account_id, "session_version": 0}
+            routing = {key: row[key] for key in ("proxy_mode", "proxy_url") if key in row}
             row = {"account_id": account_id, "status": "disconnected", "session_version": row.get("session_version", 0) + 1,
-                   "remote_account_id": row.get("remote_account_id")}
+                   "remote_account_id": row.get("remote_account_id"), **routing}
+            self.store.put("account", account_id, row)
+            return self.public(row)
+
+    def set_proxy(self, account_id: int, mode: str, url: str | None = None) -> dict:
+        if mode not in ("default", "direct", "custom"):
+            raise ValueError("Proxy mode must be default, direct or custom")
+        if mode != "custom" and url:
+            raise ValueError("A proxy address is only accepted in custom mode")
+        with self.store.lock:
+            row = self.store.get("account", account_id) or {"account_id": account_id, "status": "disconnected", "session_version": 0}
+            saved = normalized_proxy(url or row.get("proxy_url")) if mode == "custom" else row.get("proxy_url")
+            if row.get("proxy_mode", "default") == mode and row.get("proxy_url") == saved:
+                return self.public(row)
+            row.update(proxy_mode=mode, session_version=row.get("session_version", 0) + 1,
+                       pairing_generation=row.get("pairing_generation", 0) + 1)
+            if saved:
+                row["proxy_url"] = saved
+            if row.get("cookies") or row.get("pending_cookies"):
+                row.update(status="needs_reauth", error="The account proxy changed; check the session or finish browser verification.")
             self.store.put("account", account_id, row)
             return self.public(row)
 
@@ -111,6 +139,7 @@ class Connections:
     def public(row: dict) -> dict:
         keys = ("account_id", "status", "remote_account_id", "username", "display_name", "session_ref", "session_version", "error", "help_url")
         reply = {k: row.get(k) for k in keys}
+        reply.update(proxy_public(row))
         if row.get("pairing_expires_at"):
             reply["pairing_expires_at"] = datetime.fromtimestamp(row["pairing_expires_at"], timezone.utc).isoformat()
         return reply
