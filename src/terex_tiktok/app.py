@@ -22,6 +22,7 @@ from .reconcile import inspect_posts
 from .store import EncryptedStore
 from .worker import Worker
 from .ownership import ProcessOwnership
+from .routing import proxy_for
 
 log = logging.getLogger("tiktok.api")
 
@@ -47,6 +48,11 @@ class VerifyPost(BaseModel):
     remote_account_id: str
     remote_id: str | None = None
     operator_confirmed: bool = False
+
+
+class ProxySettings(BaseModel):
+    mode: str = Field(max_length=16)
+    url: str | None = Field(default=None, max_length=4096)
 
 
 def create_app(config: Config | None = None, *, start_worker=True) -> FastAPI:
@@ -142,6 +148,14 @@ def create_app(config: Config | None = None, *, start_worker=True) -> FastAPI:
     def check(account_id: int):
         return connections.check(account_id)
 
+    @app.put("/v1/connections/{account_id}/proxy", dependencies=[Depends(service)])
+    def proxy_settings(account_id: int, payload: ProxySettings):
+        if account_id <= 0:
+            raise ValueError("Invalid account ID")
+        result = connections.set_proxy(account_id, payload.mode, payload.url)
+        help_manager.cancel_account(account_id)
+        return result
+
     @app.delete("/v1/connections/{account_id}", dependencies=[Depends(service)])
     def disconnect(account_id: int):
         help_manager.cancel_account(account_id)
@@ -172,7 +186,7 @@ def create_app(config: Config | None = None, *, start_worker=True) -> FastAPI:
                     # emits this flag. Automatic worker reconciliation never does.
                     candidate["post_ids"] = [payload.remote_id]
                     candidate["operator_confirmed"] = True
-            proof = inspect_posts(row, candidate, config.proxy_url)
+            proof = inspect_posts(row, candidate, proxy_for(row, config))
             if proof and payload.remote_id and proof["remote_id"] != payload.remote_id:
                 return {"verified": False}
         if not proof:

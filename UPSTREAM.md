@@ -26,6 +26,11 @@ LT-Inc change (2026-10-27): add an independent, optional local Studio UI backend
 in `terex_tiktok/studio.py`. The site performs upload/signing; a request gate
 validates metadata, checkpoints the native creation ID and permits one publish
 request. Existing worker ownership, session fencing and post reconciliation apply.
+LT-Inc change (2026-10-28): add encrypted per-account proxy overrides with
+server-default/direct/custom modes, apply the route to identity, browser, upload
+and reconciliation, and fence changed routes through session versioning. Direct
+HTTP sessions do not inherit an ambient proxy. Delayed failed session checks
+cannot overwrite a newer connection or proxy selection.
 The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.

@@ -128,7 +128,21 @@ download is bounded to 512 MiB (`TIKTOK_MAX_MEDIA_BYTES`) and five minutes, with
 SHA-256 verification and at least two GiB of spare temporary disk space. Whole
 attempt deadline is fifteen minutes. Persistent state is never scratch cleanup.
 
-Optional: `TIKTOK_PROXY_URL` for the account's consistent connection route.
+Optional: `TIKTOK_PROXY_URL` is the server's default TikTok route. Each account's
+Terex panel can select **server default**, **direct (no proxy)** or **custom
+proxy**. The custom URL is encrypted with the session state and is never returned
+to the panel; only its scheme/host/port and a configured flag are exposed. Turning
+it off preserves the encrypted URL for later reuse. Direct mode also ignores
+ambient HTTP(S) proxy variables for TikTok HTTP requests. Identity, browser,
+upload and reconciliation operations all use the selected account route.
+
+Save the route before reconnecting or opening Browser verification. A route
+change increments the session version and fences an in-progress attempt before
+another send; an already submitted post remains subject to reconciliation.
+Check the session after changing the route, or reconnect the same account if
+TikTok requires it. This setting controls the uploader and its helper browser;
+your local Chrome/Edge connection is configured separately.
+
 `TIKTOK_CAPTCHA_API_KEY`, `TIKTOK_CAPTCHA_MODEL_ID`, and
 `TIKTOK_CAPTCHA_OBJECT_MODEL_ID` configure **your own** Roboflow credentials/models.
 No API keys or weights are bundled. The model helper supports only recognized

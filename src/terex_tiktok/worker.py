@@ -30,6 +30,7 @@ from .reconcile import inspect_posts, response_post_ids
 from .store import EncryptedStore
 from .ownership import ProcessOwnership
 from .studio import BrowserStudioClient
+from .routing import proxy_for
 
 log = logging.getLogger("tiktok.worker")
 QUEUE = "tiktok.workflow.v1.publish"
@@ -111,7 +112,7 @@ class Worker:
     def reconcile(self, journal: dict) -> bool:
         row = self.connections.for_verification(journal["account_id"], journal["remote_account_id"])
         if not journal.get("proof"):
-            proof = inspect_posts(row, journal, self.config.proxy_url)
+            proof = inspect_posts(row, journal, proxy_for(row, self.config))
             if not proof:
                 return False
             journal["proof"] = proof
@@ -194,15 +195,16 @@ class Worker:
                 UPLOADS.labels("rate_limited").inc()
                 return
             studio = self.config.upload_mode == "studio"
+            proxy_url = proxy_for(row, self.config)
             if not studio:
-                identity = verify_identity(row["cookies"], row["user_agent"], self.config.proxy_url)
+                identity = verify_identity(row["cookies"], row["user_agent"], proxy_url)
                 if identity.remote_account_id != journal["remote_account_id"]:
                     raise SessionRejected("TikTok returned a different account identity")
             with tempfile.TemporaryDirectory(prefix="publish-", dir=self.config.scratch_dir) as tmp:
                 path = Path(tmp) / "video.mp4"
                 with STAGES.labels("download").time():
                     size = download_media(publication["media_url"], publication["media_sha256"], path, self.config, guard)
-                account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=self.config.proxy_url)
+                account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=proxy_url)
                 uploader = (BrowserStudioClient(account, timeout=20, guard=guard,
                                                expected_remote_account_id=journal["remote_account_id"])
                             if studio else Client(account, timeout=20, guard=guard))
@@ -258,7 +260,7 @@ class Worker:
                         prepared["session"].close()
                 self._checkpoint(lease, journal, "verifying", submitting=True)
                 with STAGES.labels("verify").time():
-                    proof = inspect_posts(row, journal, self.config.proxy_url, guard)
+                    proof = inspect_posts(row, journal, proxy_for(row, self.config), guard)
                 if not proof:
                     self._failure(lease, "needs_attention", "upload_unknown", "TikTok accepted the request, but the actual post is not yet verified. No automatic re-upload.")
                     UPLOADS.labels("unverified").inc()
