@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
+import logging
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -9,6 +10,8 @@ from .config import Config
 from .identity import Identity, SessionRejected, checked_cookies, verify_identity
 from .store import EncryptedStore
 from .routing import normalized_proxy, proxy_for, proxy_public
+
+log = logging.getLogger("tiktok.connections")
 
 
 def iso_now() -> str:
@@ -61,6 +64,10 @@ class Connections:
         agent = row.get("pending_user_agent", row.get("user_agent"))
         if not cookies or not agent:
             return self.public(row)
+        route = row.get("proxy_mode", "default")
+        route = route if route in ("default", "direct", "custom") else "invalid"
+        log.info("checking session account_id=%s session_version=%s route_mode=%s pending=%s",
+                 account_id, row.get("session_version", 0), route, bool(row.get("pending_cookies")))
         try:
             identity = self.verify(cookies, agent, proxy_for(row, self.config))
         except SessionRejected as exc:
@@ -73,10 +80,15 @@ class Connections:
                     return self.public(current)
                 current.update(status="needs_reauth", error=str(exc))
                 self.store.put("account", account_id, current)
+                log.warning("session rejected account_id=%s session_version=%s route_mode=%s",
+                            account_id, current.get("session_version", 0), route)
                 return self.public(current)
         # A connection exported from the extension may need server-side browser
         # verification; preserve its encrypted payload for the helper, not logs.
-        return self.accept(account_id, cookies, agent, identity, row.get("session_version", 0), row.get("pairing_generation", 0))
+        result = self.accept(account_id, cookies, agent, identity, row.get("session_version", 0), row.get("pairing_generation", 0))
+        log.info("session verified account_id=%s session_version=%s route_mode=%s",
+                 account_id, result["session_version"], route)
+        return result
 
     def accept(self, account_id: int, cookies: list[dict], agent: str, identity: Identity, expected_version: int,
                expected_pairing_generation: int | None = None) -> dict:

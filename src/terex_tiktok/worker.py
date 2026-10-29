@@ -174,6 +174,9 @@ class Worker:
         started = time.monotonic()
         deadline = started + 900
         external_started = False
+        context = (f"publication_id={publication_id} attempt_id={claim['attempt_id']}"
+                   f" account_id={journal['account_id']} session_version={journal['session_version']}"
+                   f" upload_mode={self.config.upload_mode}")
         def guard():
             lease.check()
             if self.stop.is_set() or time.monotonic() >= deadline:
@@ -184,13 +187,18 @@ class Worker:
             # physical work. Lost Claim responses leave no orphan operation.
             self._checkpoint(lease, journal, "uploading")
             row = self.connections.require(journal["account_id"], journal["session_version"], journal["remote_account_id"])
+            route_mode = row.get("proxy_mode", "default")
+            route_mode = route_mode if route_mode in ("default", "direct", "custom") else "invalid"
+            proxied = route_mode == "custom" or (route_mode == "default" and bool(self.config.proxy_url))
+            context += f" route_mode={route_mode} proxied={proxied}"
+            log.info("upload attempt %s", context)
             cooldown = self.store.get("upload-cooldown", journal["account_id"]) or {}
             remaining = (max(0, math.ceil(cooldown.get("not_before", 0) - time.time()))
                          if cooldown.get("remote_account_id") == journal["remote_account_id"] else 0)
             if remaining:
                 # The wait belongs to the account, so another queued video must
                 # not immediately hit TikTok or extend the original cooldown.
-                self._failure(lease, "retry_wait", "tiktok_account_cooldown", "TikTok uploads for this account are paused after a rate-limit response.",
+                self._failure(lease, "retry_wait", "tiktok_account_cooldown", "TikTok uploads for this account are paused after an upload refusal.",
                               retryable=True, retry_after_seconds=remaining)
                 UPLOADS.labels("rate_limited").inc()
                 return
@@ -282,6 +290,7 @@ class Worker:
             self._failure(lease, "needs_attention", "tiktok_rejected", "TikTok rejected publication; review the account and video before retrying.")
             UPLOADS.labels("rejected").inc()
         except (NotLoggedInError, SessionRejected):
+            log.warning("upload session rejected %s phase=%s", context, journal["phase"])
             with self.store.lock:
                 current = self.store.get("account", journal["account_id"])
                 replaced = bool(current and current.get("session_version") != journal["session_version"])
@@ -314,7 +323,7 @@ class Worker:
                                    {"remote_account_id": journal["remote_account_id"], "not_before": until})
                 # CodeN 30411 can also be a web-client refusal; a longer wait
                 # controls retries but does not establish the underlying cause.
-                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload with a rate-limit response. Uploads for this account are paused before another attempt.",
+                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload. Uploads for this account are paused; the gateway code alone does not establish the cause.",
                               retryable=True, retry_after_seconds=delay)
                 UPLOADS.labels("rate_limited").inc()
             else:
@@ -325,7 +334,8 @@ class Worker:
             detail = ""
             if isinstance(exc, UploadError):
                 detail = f" stage={exc.stage!r} status={exc.status} provider_code={exc.provider_code} retry_after_seconds={exc.retry_after_seconds}"
-            log.warning("upload failed publication_id=%s attempt_id=%s phase=%s error_type=%s%s", publication_id, claim["attempt_id"], journal["phase"], type(exc).__name__, detail)
+                detail += f" response_kind={exc.diagnostics.get('response_kind')} request_id_tag={exc.diagnostics.get('request_id_tag')}"
+            log.warning("upload failed %s phase=%s error_type=%s%s", context, journal["phase"], type(exc).__name__, detail)
         finally:
             if prepared:
                 try:

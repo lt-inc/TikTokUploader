@@ -35,6 +35,15 @@ The original CLI,
 MCP server, web application and scheduler are not included. Terex owns the
 calendar, metadata, attempt authorization and publication history.
 
+LT-Inc change (2026-10-29): identity fallback preserves cookie scopes and expiry;
+extension exports the active tab cookie store and reports rejected sessions
+explicitly. Identity status parsing fails closed and diagnostics exclude remote
+text. Upload diagnostics correlate account/session/route/attempt and bounded
+provider response metadata without storing credentials or response bodies.
+Live investigation found route-dependent session acceptance; the existing HTTP
+transport completed a media transfer for the repaired account. No transport
+default was changed and no final publication was sent by the diagnostic.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

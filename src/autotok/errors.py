@@ -8,6 +8,7 @@ endpoint, so a retry cannot create a duplicate post.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from datetime import datetime, timezone
@@ -40,9 +41,40 @@ def _provider_code(payload) -> int | None:
     if isinstance(code, bool):
         return None
     try:
-        return int(code) if isinstance(code, (str, int)) else None
+        number = int(code) if isinstance(code, (str, int)) else None
+        return number if number is not None and 0 <= number <= 2**31 - 1 else None
     except ValueError:
         return None
+
+
+def upload_diagnostics(response, *, payload=None) -> dict:
+    """Bounded upload response facts, shared by HTTP, Studio and operator probes.
+
+    Never return provider text, URLs, header values or credentials. Hash the
+    provider request ID so responses can be correlated without echoing it.
+    """
+    kind = "non_json"
+    if payload is None:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            pass
+    metadata = payload.get("ResponseMetadata") if isinstance(payload, dict) else None
+    if isinstance(payload, dict):
+        error = metadata.get("Error") if isinstance(metadata, dict) else payload.get("Error")
+        kind = "error" if error else "result" if "Result" in payload else "other_object"
+    elif payload is not None:
+        kind = "non_object"
+    request_id = metadata.get("RequestId") if isinstance(metadata, dict) else None
+    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 512:
+        request_id = None
+    status = response.status_code
+    return {
+        "status": status if type(status) is int and 100 <= status <= 599 else None,
+        "provider_code": _provider_code(payload),
+        "response_kind": kind,
+        "request_id_tag": hashlib.sha256(request_id.encode()).hexdigest()[:16] if request_id else None,
+    }
 
 
 class AutotokError(Exception):
@@ -98,7 +130,7 @@ class UploadError(AutotokError):
 
     def __init__(self, message: str, *, status: int | None = None, body: str | None = None,
                  provider_code: int | None = None, retry_after: str | None = None, stage: str | None = None,
-                 rate_limited: bool = False):
+                 rate_limited: bool = False, diagnostics: dict | None = None):
         super().__init__(message)
         self.status = status
         self.body = body
@@ -106,6 +138,7 @@ class UploadError(AutotokError):
         self.retry_after_seconds = _retry_after_seconds(retry_after)
         self.stage = stage
         self._rate_limited = rate_limited
+        self.diagnostics = diagnostics or {}
         if self.provider_code is None and body:
             try:
                 self.provider_code = _provider_code(json.loads(body))
@@ -125,10 +158,11 @@ class UploadError(AutotokError):
                 pass
         # Responses may contain temporary upload credentials. Retain only the
         # status, provider code and retry timing needed for recovery and logs.
+        facts = upload_diagnostics(response, payload=payload)
         return cls(f"{stage}: TikTok rejected the upload request (HTTP {response.status_code})",
                    status=response.status_code, provider_code=_provider_code(payload),
                    retry_after=response.headers.get("Retry-After"), stage=stage,
-                   rate_limited="too many request" in response.text.lower())
+                   rate_limited="too many request" in response.text.lower(), diagnostics=facts)
 
 
 class PublishError(AutotokError):

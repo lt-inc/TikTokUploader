@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import replace
@@ -78,7 +79,10 @@ def test_pre_submit_refusal_defers_account_without_sending_or_losing_session(
     if header == "http-date":
         header = format_datetime(datetime.fromtimestamp(time.time() + 3600, timezone.utc), usegmt=True)
     # Error metadata lies beyond the old 500-character diagnostic excerpt.
-    payload = {"padding": "x" * 600, "ResponseMetadata": {"Error": {"CodeN": 30411}}, "token": "do-not-log"} if status == 200 else None
+    request_id = "https://provider.invalid/?token=do-not-log"
+    payload = {"padding": "x" * 600, "ResponseMetadata": {
+        "RequestId": request_id, "Error": {"CodeN": 30411, "Message": "do-not-log"}},
+        "token": "do-not-log"} if status == 200 else None
     refused = response(status, payload, header)
     calls = []
     def refuse(*args, **kwargs):
@@ -104,6 +108,10 @@ def test_pre_submit_refusal_defers_account_without_sending_or_losing_session(
     assert account["session_version"] == 2 and account["user_agent"] == "renewed browser agent"
     assert calls == ["request"]
     assert "do-not-log" not in caplog.text and "session-secret" not in caplog.text
+    assert "account_id=18 session_version=1 upload_mode=http route_mode=default proxied=False" in caplog.text
+    if payload is not None:
+        assert "response_kind=error" in caplog.text
+        assert "request_id_tag=" + hashlib.sha256(request_id.encode()).hexdigest()[:16] in caplog.text
 
 
 def test_account_cooldown_survives_reconnect_restart_and_blocks_sibling_without_extension(publishing, monkeypatch):
