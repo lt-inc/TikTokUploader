@@ -210,8 +210,10 @@ class Worker:
                     raise SessionRejected("TikTok returned a different account identity")
             with tempfile.TemporaryDirectory(prefix="publish-", dir=self.config.scratch_dir) as tmp:
                 path = Path(tmp) / "video.mp4"
+                log.info("media download started %s", context)
                 with STAGES.labels("download").time():
                     size = download_media(publication["media_url"], publication["media_sha256"], path, self.config, guard)
+                log.info("media download complete %s size_bytes=%s", context, size)
                 account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=proxy_url)
                 uploader = (BrowserStudioClient(account, timeout=20, guard=guard,
                                                expected_remote_account_id=journal["remote_account_id"])
@@ -222,11 +224,13 @@ class Worker:
                     self.store.put("publication", publication_id, journal)
                     self._checkpoint(lease, journal, "uploading")
                 with STAGES.labels("transfer").time():
+                    log.info("upload transfer started %s size_bytes=%s", context, size)
                     journal["media_id"] = uploader.transfer(prepared)
                     journal["phase"] = "transferred"
                     self.store.put("publication", publication_id, journal)
                     self._checkpoint(lease, journal, "uploading")
                     TRANSFER.labels("upload").inc(size)
+                    log.info("upload transfer complete %s size_bytes=%s", context, size)
                 if self.browser_help and not studio:
                     # Keep the transferred project while the operator solves
                     # any device/CAPTCHA check in this very browser.
