@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from http.cookiejar import Cookie
-from urllib.parse import urlparse
-
 import logging
+import math
+from dataclasses import dataclass
 
 import requests
 
 log = logging.getLogger("tiktok.identity")
+IDENTITY_URL = "https://www.tiktok.com/passport/web/account/info/"
 
 
 class SessionRejected(Exception):
@@ -27,6 +26,11 @@ def checked_cookies(cookies: list[dict]) -> list[dict]:
         raise ValueError("Expected 1–200 TikTok cookies")
     result = []
     for cookie in cookies:
+        if not isinstance(cookie, dict):
+            raise ValueError("Invalid cookie")
+        if cookie.get("partitionKey") is not None:
+            # Neither HTTP client can reproduce a browser cookie partition.
+            raise ValueError("Partitioned TikTok cookies cannot be imported; use browser verification")
         domain = str(cookie.get("domain", "")).lstrip(".").lower()
         if domain != "tiktok.com" and not domain.endswith(".tiktok.com"):
             raise ValueError("Only tiktok.com cookies are accepted")
@@ -39,7 +43,7 @@ def checked_cookies(cookies: list[dict]) -> list[dict]:
         if normalized["sameSite"] not in ("Strict", "Lax", "None"):
             normalized["sameSite"] = "Lax"
         expiry = cookie.get("expirationDate", cookie.get("expires"))
-        if isinstance(expiry, (int, float)) and expiry > 0:
+        if type(expiry) in (int, float) and math.isfinite(expiry) and expiry > 0:
             normalized["expires"] = expiry
         result.append(normalized)
     if not any(c["name"] == "sessionid" and c["value"] for c in result):
@@ -54,25 +58,37 @@ def authenticated_session(cookies: list[dict], user_agent: str, proxy: str | Non
         session.proxies.update({"http": proxy, "https": proxy})
     session.headers.update({"User-Agent": user_agent, "Referer": "https://www.tiktok.com/", "Accept": "application/json"})
     for c in cookies:
-        session.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"), secure=c.get("secure", True))
+        expiry = c.get("expires", c.get("expirationDate"))
+        session.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"),
+                            secure=c.get("secure", True),
+                            expires=int(expiry) if type(expiry) in (int, float) and math.isfinite(expiry) and expiry > 0 else None)
     return session
 
 
-def _identity(body: dict, via_proxy: bool, client: str) -> Identity | None:
-    """The verified identity, or None when TikTok says the session is not authenticated."""
-    data = body.get("data", {})
-    if body.get("message") not in (None, "success") or not isinstance(data, dict):
-        # TikTok's own status fields only; never the cookies or the response body.
-        fields = data if isinstance(data, dict) else {}
-        log.warning("identity check not authenticated client=%s message=%r error_code=%r description=%r via_proxy=%s",
-                    client, str(body.get("message"))[:80], fields.get("error_code"), str(fields.get("description"))[:120], via_proxy)
+def _identity(body: object, via_proxy: bool, client: str) -> Identity | None:
+    """Accept only a successful authenticated self-account API response."""
+    fields = body if isinstance(body, dict) else {}
+    data = fields.get("data")
+    data = data if isinstance(data, dict) else {}
+    codes = [obj[key] for obj in (fields, data) for key in ("error_code", "status_code") if key in obj]
+    if fields.get("message") != "success" or any(type(code) not in (int, str) or code not in (0, "0") for code in codes):
+        # Even server error text can echo credentials. Log bounded numeric codes,
+        # never message/description, response bodies or exception text.
+        code = next((int(c) for c in codes if type(c) is int and 0 < c <= 999999), None)
+        log.warning("identity check not authenticated client=%s error_code=%s via_proxy=%s", client, code, via_proxy)
         return None
     user = data.get("user", data.get("user_info", data))
+    if not isinstance(user, dict):
+        return None
     uid = user.get("user_id_str", user.get("user_id", user.get("uid")))
     username = user.get("username", user.get("screen_name", user.get("unique_id")))
-    if not uid or not username:
-        raise SessionRejected("TikTok did not return a verified account identity")
-    return Identity(str(uid), str(username), str(user.get("name", user.get("nickname", username))))
+    if (type(uid) not in (str, int) or not str(uid).isascii() or not str(uid).isdigit()
+            or not 0 < len(str(uid)) <= 32 or int(uid) <= 0
+            or not isinstance(username, str) or not username.strip() or len(username) > 128):
+        log.warning("identity check missing self identity client=%s via_proxy=%s", client, via_proxy)
+        return None
+    name = user.get("name", user.get("nickname", username))
+    return Identity(str(uid), username, name if isinstance(name, str) and len(name) <= 256 else username)
 
 
 def _chrome_identity(cookies: list[dict], user_agent: str, proxy: str | None) -> Identity | None:
@@ -81,11 +97,13 @@ def _chrome_identity(cookies: list[dict], user_agent: str, proxy: str | None) ->
     from autotok.proxy import parse_proxy
 
     parsed = parse_proxy(proxy)
-    jar = {c["name"]: c["value"] for c in cookies}
     try:
-        response = impersonated_get("https://www.tiktok.com/passport/web/account/info/?aid=1459",
-                                    headers={"User-Agent": user_agent, "Referer": "https://www.tiktok.com/", "Accept": "application/json"},
-                                    cookies=jar, proxies=parsed.for_requests() if parsed else None, timeout=(10, 20), allow_redirects=False)
+        with authenticated_session(cookies, user_agent, proxy) as session:
+            # A dictionary would overwrite same-name cookies from other scopes
+            # and send unrelated/expired cookies to this authenticated endpoint.
+            response = impersonated_get(f"{IDENTITY_URL}?aid=1459", headers=dict(session.headers),
+                                        cookies=session.cookies, proxies=parsed.for_requests() if parsed else None,
+                                        timeout=(10, 20), allow_redirects=False)
         return _identity(response.json(), bool(proxy), "chrome") if response.status_code == 200 else None
     except SessionRejected:
         raise
@@ -96,7 +114,7 @@ def _chrome_identity(cookies: list[dict], user_agent: str, proxy: str | None) ->
 
 def verify_identity(cookies: list[dict], user_agent: str, proxy: str | None = None) -> Identity:
     with authenticated_session(cookies, user_agent, proxy) as session:
-        response = session.get("https://www.tiktok.com/passport/web/account/info/", params={"aid": 1459}, timeout=(10, 20), allow_redirects=False)
+        response = session.get(IDENTITY_URL, params={"aid": 1459}, timeout=(10, 20), allow_redirects=False)
         if response.status_code != 200:
             log.warning("identity check rejected status=%s via_proxy=%s", response.status_code, bool(proxy))
             raise SessionRejected("TikTok did not accept the session; reconnect the account")

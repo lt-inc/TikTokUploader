@@ -17,7 +17,12 @@ button.addEventListener('click', async () => {
     }
     const approved = await chrome.permissions.request({origins: [`${server.origin}/*`]});
     if (!approved) throw new Error('Access to your Terex address was not granted.');
-    const cookies = (await chrome.cookies.getAll({domain: 'tiktok.com'})).filter(cookie => {
+    // A spanning extension popup can run in a different cookie store from an
+    // incognito tab. Never silently export a different browser session.
+    const stores = await chrome.cookies.getAllCookieStores();
+    const store = stores.find(candidate => candidate.tabIds.includes(tab.id));
+    if (!store) throw new Error('Could not identify this tab\'s cookie store. Reopen TikTok and try again.');
+    const cookies = (await chrome.cookies.getAll({domain: 'tiktok.com', storeId: store.id})).filter(cookie => {
       const domain = cookie.domain.replace(/^\./, '').toLowerCase();
       return domain === 'tiktok.com' || domain.endsWith('.tiktok.com');
     });
@@ -39,8 +44,11 @@ button.addEventListener('click', async () => {
     if (!response.ok) throw new Error(payload.error || payload.detail || 'Terex could not accept this connection.');
     if (payload.status === 'connected') {
       result.textContent = `Connected: @${payload.username}. Return to Terex and refresh the account.`;
+    } else if (payload.status === 'needs_reauth' || payload.status === 'challenge') {
+      const reason = typeof payload.error === 'string' ? ` ${payload.error.slice(0, 300)}` : '';
+      result.textContent = `Not connected: TikTok has not verified this session.${reason} Open browser verification in Terex on the selected account route, or sign in again and export with a new connection code.`;
     } else {
-      result.textContent = 'Session received. Return to Terex and check the account or open browser verification.';
+      result.textContent = 'Terex did not confirm a connected account. Check the account in Terex before generating another connection code.';
     }
   } catch (error) {
     result.textContent = error.name === 'AbortError'
