@@ -13,4 +13,5 @@ jobs:
       - run: pip install '.[test]'
       - run: python -m compileall -q src
       - run: pytest -q
+      - run: node --test tests/extension_session.test.cjs
       - run: docker build -t terex-tiktok-uploader:smoke .

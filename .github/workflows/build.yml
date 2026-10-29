@@ -26,6 +26,7 @@ jobs:
           python-version: '3.12'
       - run: pip install '.[test]'
       - run: python -m compileall -q src && pytest -q
+      - run: node --test tests/extension_session.test.cjs
 
       - uses: docker/setup-buildx-action@v3
 
