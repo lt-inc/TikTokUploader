@@ -44,6 +44,15 @@ Live investigation found route-dependent session acceptance; the existing HTTP
 transport completed a media transfer for the repaired account. No transport
 default was changed and no final publication was sent by the diagnostic.
 
+LT-Inc follow-up (2026-10-29): the live 57 MiB private pilot completed media
+transfer but failed before final POST with CookieConflictError after browser
+verification added scoped msToken cookies. Publish preparation now selects the
+first cookie applicable to the actual final request URL using Requests' own
+cookie policy and ordering, preserving the jar. A focused regression reproduces
+the failure and covers domain/path/expiry selection. Safe download/transfer and
+per-part progress logs expose which stage is taking time without logging URLs,
+cookies or signatures.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

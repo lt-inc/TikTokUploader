@@ -138,6 +138,17 @@ def _json(r: requests.Response, what: str) -> dict:
                           status=r.status_code, body=r.text[:500]) from None
 
 
+def _cookie_for_url(session: requests.Session, name: str, url: str) -> str:
+    # Use the same domain/path/secure/expiry policy and ordering as the final
+    # request. CookieJar.get(name) is ambiguous for valid same-name scopes.
+    header = session.prepare_request(requests.Request("POST", url)).headers.get("Cookie", "")
+    for item in header.split(";"):
+        key, _, value = item.strip().partition("=")
+        if key == name:
+            return value
+    return ""
+
+
 class Client:
     """An authenticated TikTok uploader for one account.
 
@@ -417,7 +428,8 @@ class Client:
                     data=chunk,
                     timeout=max(self.timeout, 120),
                 )
-                log.debug("uploaded part %d (%d bytes)", part, len(chunk))
+                log.info("upload part complete account=%s part=%s transferred_bytes=%s total_bytes=%s",
+                         self.account.name, part, min(part * CHUNK_SIZE, file_size), file_size)
         if not crcs:
             raise ValidationError(f"video file is empty: {path}")
 
@@ -485,7 +497,8 @@ class Client:
 
     def _prepare_publish_request(self, session: requests.Session) -> tuple:
         self._guard()
-        ms_token = session.cookies.get("msToken") or ""
+        url = "https://www.tiktok.com/tiktok/web/project/post/v1/"
+        ms_token = _cookie_for_url(session, "msToken", url)
         base = "https://www.tiktok.com/api/v1/web/project/post/"
         query = f"app_name=tiktok_web&channel=tiktok_web&device_platform=web&aid={AID}&msToken={ms_token}"
         if self._signer is not None:
@@ -509,7 +522,6 @@ class Client:
             "origin": "https://www.tiktok.com",
             "referer": "https://www.tiktok.com/",
         }
-        url = "https://www.tiktok.com/tiktok/web/project/post/v1/"
         return url, params, headers
 
     def _submit_publish_request(self, session: requests.Session, payload: dict, prepared_request: tuple) -> dict:
