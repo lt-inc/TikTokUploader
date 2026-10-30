@@ -60,6 +60,12 @@ publication, attempt, account and session IDs. URLs, paths, headers, bodies and
 exception text are never logged. Failures are shown to operators as a media
 download failure within the existing `upload_preflight_failed` retryable code.
 
+LT-Inc change (2026-10-30): optional `TIKTOK_MEDIA_DOWNLOAD_ORIGIN` sends the media
+GET to a fixed trusted origin (e.g. in-cluster MinIO) instead of the public
+hairpin path, keeping the validated original URL's exact signed path/query and Host
+header. Diagnostics gain `media_route=internal|public`. No fallback, retry, proxy
+or credential change; the network root cause is not asserted by this change.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

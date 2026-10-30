@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import Config
+from .config import Config, parse_media_origin
 from .metrics import MEDIA_FAILURES, TRANSFER
 
 log = logging.getLogger(__name__)
@@ -27,8 +27,9 @@ _HTTP_VERSIONS = frozenset({"HTTP/1.0", "HTTP/1.1", "HTTP/2"})
 class _Trace:
     """Per-download facts. Only numbers and members of closed sets are kept."""
 
-    def __init__(self):
+    def __init__(self, route: str = "public"):
         self.started = time.monotonic()
+        self.route = route  # internal (fixed trusted origin) | public (original URL authority)
         self.stage = "validate"  # validate -> request -> body -> verify
         self.reason = None  # set where the cause is known without an exception
         self.status = None
@@ -79,7 +80,7 @@ class _Trace:
             return "content_decoding_error"
         if isinstance(exc, httpx.RemoteProtocolError):
             if self.stage != "body":
-                return "peer_closed_before_headers"
+                return "remote_protocol_before_headers"
             if self.framing == "content_length" and not self.encoded and self.declared is not None and self.received < self.declared:
                 return "body_shorter_than_declared"
             return "chunked_body_interrupted" if self.framing == "chunked" else "body_interrupted"
@@ -91,6 +92,7 @@ class _Trace:
         now = time.monotonic()
         ms = lambda value: None if value is None else round((value - self.started) * 1000)
         values = {
+            "media_route": self.route,
             "stage": self.stage,
             "status": self.status,
             "http_version": self.http_version,
@@ -112,7 +114,7 @@ class _Trace:
 
 def download_media(url: str, expected_sha: str, destination: Path, config: Config, guard, context: str = "") -> int:
     """Download and verify media. `context` holds worker/publication IDs for log correlation."""
-    trace = _Trace()
+    trace = _Trace("internal" if config.media_download_origin else "public")
     try:
         total = _download(url, expected_sha, destination, config, guard, trace)
     except Exception as exc:
@@ -124,14 +126,40 @@ def download_media(url: str, expected_sha: str, destination: Path, config: Confi
     return total
 
 
+def _transport(url: str, config: Config, trace: _Trace) -> tuple[str, dict[str, str]]:
+    """Return the URL to request and extra headers.
+
+    With a trusted origin only the scheme/authority change; the signed path/query are kept
+    byte for byte and the original Host header is sent so the signature still verifies.
+    """
+    try:
+        origin = parse_media_origin(config.media_download_origin)
+    except ValueError:
+        trace.reason = "invalid_media_origin"
+        raise
+    if origin is None:
+        return url, {}
+    if any(ord(c) <= 32 or ord(c) == 127 for c in url) or "\\" in url:
+        trace.reason = "invalid_url"
+        raise ValueError("Invalid media URL")
+    rest = url[url.index("://") + 3:]
+    cut = min((i for i in (rest.find(c) for c in "/?#") if i >= 0), default=len(rest))
+    target = rest[cut:].split("#", 1)[0]
+    if not target.startswith(("/", "?")):
+        target = "/" + target
+    return origin + target, {"Host": httpx.URL(url).netloc.decode("ascii")}
+
+
 def _download(url: str, expected_sha: str, destination: Path, config: Config, guard, trace: _Trace) -> int:
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.username or not parsed.hostname:
+    if (parsed.scheme not in ("http", "https") or parsed.username is not None
+            or parsed.password is not None or not parsed.hostname):
         trace.reason = "invalid_url"
         raise ValueError("Invalid media URL")
     if not config.media_hosts or parsed.hostname not in config.media_hosts:
         trace.reason = "host_not_allowed"
         raise ValueError("The media host is not on TIKTOK_MEDIA_HOSTS allowlist")
+    request_url, headers = _transport(url, config, trace)
     if len(expected_sha) != 64 or any(x not in "0123456789abcdef" for x in expected_sha.lower()):
         trace.reason = "invalid_checksum"
         raise ValueError("The publication requires a SHA-256 checksum")
@@ -143,7 +171,7 @@ def _download(url: str, expected_sha: str, destination: Path, config: Config, gu
     started = time.monotonic()
     trace.stage = "request"
     with httpx.Client(timeout=httpx.Timeout(30, connect=10), trust_env=False) as client:
-        with client.stream("GET", url, follow_redirects=False) as response:
+        with client.stream("GET", request_url, headers=headers, follow_redirects=False) as response:
             trace.response(response)
             response.raise_for_status()
             try:
