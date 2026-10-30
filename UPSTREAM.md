@@ -53,6 +53,13 @@ the failure and covers domain/path/expiry selection. Safe download/transfer and
 per-part progress logs expose which stage is taking time without logging URLs,
 cookies or signatures.
 
+LT-Inc change (2026-10-30): media downloads log one bounded diagnostic line per
+attempt (stage, closed-set reason and exception class, HTTP status/version, body
+framing, declared/received/written bytes, elapsed/idle time) correlated by worker,
+publication, attempt, account and session IDs. URLs, paths, headers, bodies and
+exception text are never logged. Failures are shown to operators as a media
+download failure within the existing `upload_preflight_failed` retryable code.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

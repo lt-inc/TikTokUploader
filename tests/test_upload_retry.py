@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
+import httpx
 import pytest
 import requests
 
@@ -112,6 +113,21 @@ def test_pre_submit_refusal_defers_account_without_sending_or_losing_session(
     if payload is not None:
         assert "response_kind=error" in caplog.text
         assert "request_id_tag=" + hashlib.sha256(request_id.encode()).hexdigest()[:16] in caplog.text
+
+
+def test_media_download_failure_is_distinct_retryable_and_never_reaches_tiktok(publishing, monkeypatch, caplog):
+    worker, store, seen = publishing
+    def interrupted(*args):
+        raise httpx.RemoteProtocolError("peer closed https://media.example/video.mp4?token=do-not-log")
+    monkeypatch.setattr("terex_tiktok.worker.download_media", interrupted)
+    monkeypatch.setattr(Client, "prepare", lambda *args, **kwargs: pytest.fail("A failed download must not reach TikTok"))
+    worker.execute({"publication_id": 14, "attempt_id": "attempt-14", "expected_version": 1})
+    failed = [payload for operation, payload in seen if operation == "fail"]
+    assert len(failed) == 1 and failed[0]["code"] == "upload_preflight_failed" and failed[0]["retryable"] is True
+    assert failed[0]["message"].startswith("Media download failed")
+    assert store.get("publication", 14)["phase"] == "preparing"
+    assert f"worker_id={worker.worker_id} account_id=18" in caplog.text
+    assert "do-not-log" not in caplog.text and "session-secret" not in caplog.text
 
 
 def test_account_cooldown_survives_reconnect_restart_and_blocks_sibling_without_extension(publishing, monkeypatch):
