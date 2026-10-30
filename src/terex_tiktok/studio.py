@@ -18,7 +18,7 @@ from autotok.browsers import launch_chromium, sync_playwright
 from autotok.errors import PublishError, PublishUncertainError, UploadError, ValidationError
 from autotok.uploader import MAX_CAPTION_LENGTH, _visibility, resolve_video_path
 
-from .browser import browser_permit
+from .browser import browser_permit, session_cookies
 from .identity import SessionRejected, _identity, checked_cookies
 
 STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload"
@@ -198,7 +198,7 @@ class _StudioSession:
             self.stack.close()
 
     def export_cookies(self) -> list[dict]:
-        return checked_cookies([c for c in self.context.cookies() if _tiktok_host(c.get("domain", "").lstrip("."))])
+        return session_cookies(self.context)
 
     def _request_guard(self):
         if self.gate.error is not None:
