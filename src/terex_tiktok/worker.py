@@ -174,8 +174,9 @@ class Worker:
         started = time.monotonic()
         deadline = started + 900
         external_started = False
-        context = (f"publication_id={publication_id} attempt_id={claim['attempt_id']}"
-                   f" account_id={journal['account_id']} session_version={journal['session_version']}"
+        media_failed = False
+        context =  (f"publication_id={publication_id} attempt_id={claim['attempt_id']}"
+                   f" worker_id={self.worker_id} account_id={journal['account_id']} session_version={journal['session_version']}"
                    f" upload_mode={self.config.upload_mode}")
         def guard():
             lease.check()
@@ -212,7 +213,13 @@ class Worker:
                 path = Path(tmp) / "video.mp4"
                 log.info("media download started %s", context)
                 with STAGES.labels("download").time():
-                    size = download_media(publication["media_url"], publication["media_sha256"], path, self.config, guard)
+                    try:
+                        size = download_media(publication["media_url"], publication["media_sha256"], path, self.config, guard, context)
+                    except Fenced:
+                        raise
+                    except Exception:
+                        media_failed = True
+                        raise
                 log.info("media download complete %s size_bytes=%s", context, size)
                 account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=proxy_url)
                 uploader = (BrowserStudioClient(account, timeout=20, guard=guard,
@@ -331,8 +338,12 @@ class Worker:
                               retryable=True, retry_after_seconds=delay)
                 UPLOADS.labels("rate_limited").inc()
             else:
-                self._failure(lease, "failed", "upload_preflight_failed", "Preparation/transfer failed before publication; safe to retry.", retryable=True)
-                UPLOADS.labels("preflight_failed").inc()
+                # The failure code stays within Terex's existing contract; only
+                # the operator-visible text identifies the media download.
+                message = ("Media download failed before publication; nothing was sent to TikTok and it is safe to retry."
+                           if media_failed else "Preparation/transfer failed before publication; safe to retry.")
+                self._failure(lease, "failed", "upload_preflight_failed", message, retryable=True)
+                UPLOADS.labels("media_download_failed" if media_failed else "preflight_failed").inc()
             # Upload bodies and exception text can include temporary credentials
             # or proxy details; log only bounded diagnostic fields.
             detail = ""
