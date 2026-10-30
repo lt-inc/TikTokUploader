@@ -7,6 +7,28 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+def parse_media_origin(value: str | None) -> str | None:
+    """Validate a deployment-controlled media transport origin; returns scheme://authority or None.
+
+    Errors never echo the value because a misconfigured URL may carry credentials.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if any(ord(c) <= 32 or ord(c) == 127 for c in value) or "?" in value or "#" in value or "\\" in value:
+        raise ValueError("TIKTOK_MEDIA_DOWNLOAD_ORIGIN must be a plain http(s) origin")
+    try:
+        parsed = urlparse(value)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("TIKTOK_MEDIA_DOWNLOAD_ORIGIN must be a plain http(s) origin") from exc
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or "@" in parsed.netloc or parsed.path not in ("", "/")
+            or parsed.params):
+        raise ValueError("TIKTOK_MEDIA_DOWNLOAD_ORIGIN must be a plain http(s) origin")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 @dataclass(frozen=True)
 class Config:
     api_token: str
@@ -24,6 +46,7 @@ class Config:
     max_media_bytes: int = 512 * 1024 * 1024
     media_hosts: tuple[str, ...] = ()
     upload_mode: str = "http"
+    media_download_origin: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -59,4 +82,5 @@ class Config:
             int(os.environ.get("TIKTOK_MAX_MEDIA_BYTES", 512 * 1024 * 1024)),
             tuple(x.strip() for x in os.environ.get("TIKTOK_MEDIA_HOSTS", "").split(",") if x.strip()),
             upload_mode,
+            parse_media_origin(os.environ.get("TIKTOK_MEDIA_DOWNLOAD_ORIGIN")),
         )

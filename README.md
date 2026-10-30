@@ -128,6 +128,18 @@ download is bounded to 512 MiB (`TIKTOK_MAX_MEDIA_BYTES`) and five minutes, with
 SHA-256 verification and at least two GiB of spare temporary disk space. Whole
 attempt deadline is fifteen minutes. Persistent state is never scratch cleanup.
 
+Optional: `TIKTOK_MEDIA_DOWNLOAD_ORIGIN` (e.g. `http://minio.infra.svc:9000`) is a
+trusted, deployment-controlled transport origin for media downloads. It must be an
+HTTP(S) origin with a hostname and no credentials, path, query or fragment; invalid
+values fail startup without echoing the value. The source URL must still pass the
+`TIKTOK_MEDIA_HOSTS` allowlist and carry no credentials. Only its scheme/authority
+are replaced; the signed path/query are preserved and the original `Host` header is
+sent so the SigV4 signature stays valid. No S3 credentials are added, redirects stay
+disabled, and SHA-256, size/time limits and fencing are unchanged. There is no
+automatic fallback to the public URL and no extra retry; a failure follows the normal
+retryable media-download failure. Download logs include `media_route=internal|public`.
+It does not affect TikTok/account proxy routing.
+
 Optional: `TIKTOK_PROXY_URL` is the server's default TikTok route. Each account's
 Terex panel can select **server default**, **direct (no proxy)** or **custom
 proxy**. The custom URL is encrypted with the session state and is never returned
