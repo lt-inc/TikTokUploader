@@ -142,6 +142,7 @@ def test_public_route_is_reported_without_origin(serve, tmp_path, caplog):
 def test_internal_origin_still_requires_allowlisted_credential_free_source_and_sha(capture, tmp_path):
     origin, seen = capture()
     for source in ("https://evil.example.test" + SIGNED, "https://user:pw@media.example.test" + SIGNED,
+                   "https://@media.example.test" + SIGNED,
                    "ftp://media.example.test" + SIGNED):
         with pytest.raises(ValueError):
             fetch_via(source, origin, tmp_path)

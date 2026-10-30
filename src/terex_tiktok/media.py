@@ -80,7 +80,7 @@ class _Trace:
             return "content_decoding_error"
         if isinstance(exc, httpx.RemoteProtocolError):
             if self.stage != "body":
-                return "peer_closed_before_headers"
+                return "remote_protocol_before_headers"
             if self.framing == "content_length" and not self.encoded and self.declared is not None and self.received < self.declared:
                 return "body_shorter_than_declared"
             return "chunked_body_interrupted" if self.framing == "chunked" else "body_interrupted"
@@ -152,7 +152,8 @@ def _transport(url: str, config: Config, trace: _Trace) -> tuple[str, dict[str, 
 
 def _download(url: str, expected_sha: str, destination: Path, config: Config, guard, trace: _Trace) -> int:
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password or not parsed.hostname:
+    if (parsed.scheme not in ("http", "https") or parsed.username is not None
+            or parsed.password is not None or not parsed.hostname):
         trace.reason = "invalid_url"
         raise ValueError("Invalid media URL")
     if not config.media_hosts or parsed.hostname not in config.media_hosts:
