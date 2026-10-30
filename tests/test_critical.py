@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import json
+import threading
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from dataclasses import replace
@@ -248,3 +249,29 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
             json={"publication_id": 12, "account_id": 18, "remote_account_id": "100", "remote_id": "999"})
         assert response.status_code == 200 and response.json()["verified"] is True
     worker.main.client.close()
+
+
+def test_publish_browser_wait_preserves_operation_and_stays_fenced():
+    from terex_tiktok import browser
+    waits, entered = [], []
+    assert browser.GATE.acquire(blocking=False)
+    threading.Timer(0.2, browser.GATE.release).start()
+    # Operator contention outlasts the default 10s-style failure path without losing the operation.
+    with browser_permit(guard=lambda: None, on_wait=lambda: waits.append(1), poll=0.02):
+        entered.append(True)
+    assert entered == [True] and waits == [1]
+    assert browser.GATE.acquire(blocking=False)
+    try:
+        checks = []
+        def guard():
+            checks.append(1)
+            if len(checks) > 3:
+                raise Fenced("cancelled while waiting")
+        with pytest.raises(Fenced):
+            with browser_permit(guard=guard, poll=0.01):
+                pytest.fail("a fenced operation must not acquire the browser")
+        with pytest.raises(TimeoutError):
+            with browser_permit(timeout=0):
+                pass
+    finally:
+        browser.GATE.release()
