@@ -256,8 +256,8 @@ def test_publish_browser_wait_preserves_operation_and_stays_fenced():
     waits, entered = [], []
     assert browser.GATE.acquire(blocking=False)
     threading.Timer(0.2, browser.GATE.release).start()
-    # Operator contention outlasts the default 10s-style failure path without losing the operation.
-    with browser_permit(guard=lambda: None, on_wait=lambda: waits.append(1), poll=0.02):
+    # A guarded operation outlasts the ordinary timeout without losing its media.
+    with browser_permit(timeout=0.01, guard=lambda: None, on_wait=lambda: waits.append(1), poll=0.02):
         entered.append(True)
     assert entered == [True] and waits == [1]
     assert browser.GATE.acquire(blocking=False)
@@ -275,3 +275,12 @@ def test_publish_browser_wait_preserves_operation_and_stays_fenced():
                 pass
     finally:
         browser.GATE.release()
+    checks = []
+    def fenced_after_acquire():
+        checks.append(1)
+        if len(checks) == 2:
+            raise Fenced("cancelled just as the browser became available")
+    with pytest.raises(Fenced):
+        with browser_permit(guard=fenced_after_acquire):
+            pytest.fail("a fenced operation must not use the acquired browser")
+    assert not browser.GATE.locked()

@@ -32,6 +32,8 @@ def browser_permit(timeout: float = 10, *, guard=None, on_wait=None, label: str 
                 guard()
             log.info("browser acquired after %.1fs %s", time.monotonic() - started, label)
     try:
+        if guard is not None:
+            guard()
         yield
     finally:
         GATE.release()
