@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import time
 from contextlib import ExitStack
@@ -288,6 +289,7 @@ class _StudioSession:
         self.media_id = None
         self.session_key = None
         self.video_candidates: set[tuple[str, str]] = set()
+        self.video_storage: dict[tuple[str, str], set[tuple[str, str]]] = {}
         self.aux_keys: set[str] = set()
         self.aux_vids: set[str] = set()
         self.committed = False
@@ -464,6 +466,8 @@ class _StudioSession:
                     exc = PublishUncertainError("The native Studio publication response could not be verified")
                 self.error = exc
             return
+        if self._observe_storage_response(response):
+            return
         observed = self._upload_action(response.url)
         if observed is None:
             return
@@ -479,6 +483,52 @@ class _StudioSession:
                 data = None
             return response.text(), data
         self._observe_upload(action, file_type, response.status, response.headers, read, response.request)
+
+    def _observe_storage_response(self, response) -> bool:
+        parts = urlparse(response.url)
+        if parts.scheme != "https" or not parts.path.startswith("/upload/v1/") or getattr(response.request, "method", None) != "POST":
+            return False
+        target = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+        candidates = self.video_storage.get(target)
+        if not candidates or self.gate.native_storage_requests.get(target, 0) == 0:
+            return False
+        try:
+            data = response.json()
+            if response.status != 200 or not isinstance(data, dict) or data.get("code") != 2000:
+                raise _NativeRejected("storage_rejected")
+            payload = data.get("data")
+            inline = payload.get("post_upload_resp") if isinstance(payload, dict) else None
+            # Initial/part acknowledgements and CRC32 alone never select video.
+            if inline is None:
+                return True
+            if not isinstance(inline, dict):
+                raise _NativeRejected("inline_commit_invalid")
+            _upload_string(inline.get("request_id"), 256)
+            results = inline.get("results")
+            if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+                raise _NativeRejected("inline_commit_results_invalid")
+            item = results[0]
+            vid = _upload_string(item.get("vid"), 256)
+            matches = {(key, media) for key, media in candidates if media == vid}
+            if len(matches) != 1:
+                raise _NativeRejected("inline_commit_identity_unknown")
+            meta = item.get("video_meta")
+            if (not isinstance(meta, dict) or meta.get("FileType") != "video"
+                    or any(isinstance(meta.get(field), bool) or not isinstance(meta.get(field), (int, float))
+                           or not math.isfinite(meta[field]) or meta[field] <= 0
+                           for field in ("Duration", "Size", "Width", "Height"))):
+                raise _NativeRejected("inline_video_meta_invalid")
+            key, vid = matches.pop()
+            if self.media_id is not None and self.media_id != vid:
+                raise _NativeRejected("commit_identity_conflict")
+            self.media_id, self.session_key, self.committed = vid, key, True
+        except Exception as exc:
+            if self.error is None:
+                reason = exc.reason if isinstance(exc, _NativeRejected) else "inline_commit_invalid"
+                self.error = (PublishUncertainError("Native video confirmation conflicted after publication; inspect the account")
+                              if self.gate.used else UploadError("Native Studio video storage response could not be verified", stage="studio inline commit",
+                                                                 diagnostics={"native": "reason=" + reason}))
+        return True
 
     def _observe_upload(self, action: str, file_type: str, status: int, headers, read, request):
         facts = {}
@@ -536,12 +586,13 @@ class _StudioSession:
         if not 1 <= len(nodes) <= MAX_UPLOAD_NODES:
             raise _NativeRejected("node_count_invalid")
         video = file_type == "video"
-        candidates, keys, vids, storage, uploads = set(), set(), set(), set(), {}
+        candidates, keys, vids, storage, uploads, video_storage = set(), set(), set(), set(), {}, {}
         for node in nodes:
             if not isinstance(node, dict):
                 raise _NativeRejected("node_invalid")
             try:
-                storage.update(self.gate.storage_for(node))
+                node_storage = self.gate.storage_for(node)
+                storage.update(node_storage)
                 for target, ids in self.gate.uploads_for(node).items():
                     uploads.setdefault(target, set()).update(ids)
             except (KeyError, TypeError, ValueError, AttributeError):
@@ -557,6 +608,8 @@ class _StudioSession:
                 except ValueError:
                     raise _NativeRejected("vid_invalid") from None
                 candidates.add((key, vid))
+                for target in node_storage:
+                    video_storage.setdefault(target, set()).add((key, vid))
                 continue
             # Cover images may carry an empty Vid, but the observed response
             # still has a session key. Track it so commits cannot be
@@ -578,9 +631,14 @@ class _StudioSession:
             raise _NativeRejected("limit_exceeded")
         if video_keys & aux_keys or video_vids & aux_vids:
             raise _NativeRejected("identity_conflict")
+        if ((video and set(video_storage) & (self.gate.storage_paths - self.video_storage.keys()))
+                or (not video and storage & self.video_storage.keys())):
+            raise _NativeRejected("storage_identity_conflict")
         # Validate the complete authenticated response before extending
         # transfer permissions. Node order never selects the video.
         self.video_candidates.update(candidates)
+        for target, identities in video_storage.items():
+            self.video_storage.setdefault(target, set()).update(identities)
         self.aux_keys, self.aux_vids = aux_keys, aux_vids
         self.gate.storage_paths.update(storage)
         for target, ids in uploads.items():
