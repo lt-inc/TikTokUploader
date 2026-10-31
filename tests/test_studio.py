@@ -142,12 +142,12 @@ def session_without_browser():
     session.error = session.media_id = session.session_key = session.result = None
     session.committed = False
     session.video_candidates = set()
-    session.other_candidates = set()
+    session.aux_keys, session.aux_vids, session.aux_unkeyed = set(), set(), False
     return session
 
 
-def native_response(action, payload=None, *, status=200, headers=None, request_payload=None):
-    url = f"https://www.tiktok.com/top/v1?Action={action}&FileType=video"
+def native_response(action, payload=None, *, status=200, headers=None, request_payload=None, file_type="video"):
+    url = f"https://www.tiktok.com/top/v1?Action={action}&FileType={file_type}"
     def parse():
         if payload is None:
             raise ValueError("non-JSON")
@@ -205,6 +205,64 @@ def test_commit_requires_one_known_identity_and_never_permits_conflicting_video(
     route = Route()
     session.gate.route(route)
     assert not route.continued and not session.gate.used
+
+
+def image_apply(session, vid="", key="image-key"):
+    node = {"Vid": vid, "SessionKey": key, "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "cover/image"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}},
+                                        file_type="image"))
+
+
+def video_apply(session):
+    node = {"Vid": "video-1", "SessionKey": "key-1", "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "v/video"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node, node]}}}))
+
+
+def test_empty_image_vid_is_auxiliary_and_only_video_commit_sets_media_id():
+    session = session_without_browser()
+    video_apply(session)
+    image_apply(session)
+    assert session.error is None and session.media_id is None
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": ""}]}},
+                                        request_payload={"SessionKey": "image-key"}))
+    assert session.error is None and session.media_id is None and not session.committed
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
+                                        request_payload={"SessionKey": "key-1"}))
+    assert session.error is None and session.committed and session.media_id == "video-1"
+
+
+def test_empty_video_vid_is_still_rejected_with_bounded_diagnostics():
+    session = session_without_browser()
+    node = {"Vid": "", "SessionKey": "secret-key", "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "v/video"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}))
+    assert isinstance(session.error, UploadError) and not session.video_candidates and not session.gate.storage_paths
+    facts = session.error.diagnostics
+    assert facts["reason"] == "vid_invalid" and facts["empty_vid"] == 1 and facts["file_type"] == "video"
+    assert "secret-key" not in facts["native"] and "tiktokcdn" not in facts["native"]
+
+
+@pytest.mark.parametrize("case", ["unknown_key", "image_names_video", "key_collision", "vid_collision", "unknown_empty_key"])
+def test_auxiliary_commits_never_select_video_and_ambiguity_fails_closed(case):
+    session = session_without_browser()
+    video_apply(session)
+    if case == "key_collision":
+        image_apply(session, key="key-1")
+    elif case == "vid_collision":
+        image_apply(session, vid="video-1")
+    else:
+        image_apply(session)
+    key, results = "image-key", [{"Vid": ""}]
+    if case == "unknown_key":
+        key = "other-key"
+    elif case == "image_names_video":
+        results = [{"Vid": "video-1"}]
+    elif case == "unknown_empty_key":
+        key = ""
+    elif case in ("key_collision", "vid_collision"):
+        assert isinstance(session.error, UploadError) and session.error.diagnostics["reason"] == "identity_conflict"
+        return
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": results}}, request_payload={"SessionKey": key}))
+    assert isinstance(session.error, UploadError) and session.media_id is None and not session.committed
 
 
 @pytest.mark.parametrize("case", ["too_many", "bad_identity", "bad_path", "bad_host"])

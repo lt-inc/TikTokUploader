@@ -16,7 +16,7 @@ from requests.structures import CaseInsensitiveDict
 
 from autotok.accounts import Account
 from autotok.browsers import launch_chromium, sync_playwright
-from autotok.errors import PublishError, PublishUncertainError, UploadError, ValidationError
+from autotok.errors import PublishError, PublishUncertainError, UploadError, ValidationError, upload_diagnostics
 from autotok.uploader import MAX_CAPTION_LENGTH, _visibility, resolve_video_path
 
 from .browser import browser_permit, session_cookies
@@ -31,6 +31,26 @@ PROJECT_PREPARATION_PATHS = {
 }
 MAX_UPLOAD_NODES = 16
 MAX_STORE_INFOS = 16
+_NATIVE_FACTS = ("action", "file_type", "reason", "nodes", "empty_vid", "empty_key", "invalid_store", "results")
+
+
+class _NativeRejected(ValueError):
+    """Bounded, value-free reason why a native upload response was rejected."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _node_counts(nodes: list) -> dict:
+    # Presence counts only; never include identity, host or storage values.
+    items = [node for node in nodes[:MAX_UPLOAD_NODES] if isinstance(node, dict)]
+    return {
+        "empty_vid": sum(1 for node in items if not node.get("Vid")),
+        "empty_key": sum(1 for node in items if not node.get("SessionKey")),
+        "invalid_store": sum(1 for node in items if not isinstance(node.get("StoreInfos"), list)
+                             or not node["StoreInfos"] or not isinstance(node.get("UploadHost"), str)),
+    }
 
 
 def _upload_string(value, limit: int) -> str:
@@ -182,7 +202,9 @@ class _StudioSession:
         self.media_id = None
         self.session_key = None
         self.video_candidates: set[tuple[str, str]] = set()
-        self.other_candidates: set[tuple[str, str]] = set()
+        self.aux_keys: set[str] = set()
+        self.aux_vids: set[str] = set()
+        self.aux_unkeyed = False
         self.committed = False
         self.result = None
         self.closed = False
@@ -310,6 +332,7 @@ class _StudioSession:
                               else UploadError("Studio response interception failed", stage="studio redirect guard"))
 
     def on_response(self, response):
+        action, file_type, facts = None, "other", {}
         try:
             if response.request == self.gate.request:
                 if 300 <= response.status < 400 or response.status >= 500:
@@ -330,58 +353,134 @@ class _StudioSession:
             action = query.get("Action", [None])[0]
             if action not in ("ApplyUploadInner", "CommitUploadInner"):
                 return
+            file_type = query.get("FileType", [None])[0]
+            file_type = file_type if file_type in ("video", "image") else "other"
             try:
                 data = response.json()
             except Exception:
                 data = None
             diagnostic = SimpleNamespace(status_code=response.status, headers=CaseInsensitiveDict(response.headers),
                                          text=response.text(), json=lambda: data)
+            facts = upload_diagnostics(diagnostic, payload=data)
             failure = UploadError.from_response("studio " + action, diagnostic, payload=data)
             if response.status != 200 or failure.provider_code not in (None, 0) or failure.rate_limited:
                 raise failure
             if action == "ApplyUploadInner":
-                nodes = data["Result"]["InnerUploadAddress"]["UploadNodes"]
-                if not isinstance(nodes, list) or not 1 <= len(nodes) <= MAX_UPLOAD_NODES:
-                    raise ValueError
-                candidates, storage = set(), set()
-                for node in nodes:
-                    candidates.add((_upload_string(node["SessionKey"], 8192), _upload_string(node["Vid"], 256)))
-                    storage.update(self.gate.storage_for(node))
-                target = self.video_candidates if query.get("FileType", [None])[0] == "video" else self.other_candidates
-                if (len(target | candidates) > MAX_UPLOAD_NODES
-                        or len(self.gate.storage_paths | storage) > MAX_UPLOAD_NODES * MAX_STORE_INFOS
-                        or (candidates & (self.other_candidates if target is self.video_candidates else self.video_candidates))):
-                    raise ValueError
-                # Validate the complete authenticated response before extending
-                # transfer permissions. Node order never selects the video.
-                target.update(candidates)
-                self.gate.storage_paths.update(storage)
+                self._apply(file_type, data, facts)
             else:
-                session_key = _upload_string(response.request.post_data_json["SessionKey"], 8192)
-                results = data["Result"]["Results"]
-                if not isinstance(results, list) or not 1 <= len(results) <= MAX_UPLOAD_NODES:
-                    raise ValueError
-                identities = {_upload_string(item["Vid"], 256) for item in results}
-                if len(identities) != 1:
-                    raise ValueError
-                media_id = identities.pop()
-                candidate = (session_key, media_id)
-                if candidate in self.other_candidates:
-                    return  # Known auxiliary media cannot select the video.
-                if candidate not in self.video_candidates:
-                    raise ValueError
-                if self.media_id is not None and self.media_id != media_id:
-                    raise UploadError("Studio committed more than one video identity", stage="studio commit")
-                self.media_id, self.session_key = media_id, session_key
-                self.committed = True
+                self._commit(response.request, data, facts)
         except Exception as exc:
             if self.error is None:
                 if response.request == self.gate.request and not isinstance(exc, (PublishError, PublishUncertainError)):
                     exc = PublishUncertainError("The native Studio publication response could not be verified")
                 elif not isinstance(exc, (UploadError, PublishError, PublishUncertainError)):
-                    exc = UploadError("Studio upload response did not contain the required transfer proof", stage="studio transfer")
+                    reason = exc.reason if isinstance(exc, _NativeRejected) else "malformed_response"
+                    facts.update(reason=reason, action=(action or "other").removesuffix("UploadInner").lower(), file_type=file_type)
+                    facts["native"] = " ".join(f"{key}={facts[key]}" for key in _NATIVE_FACTS if key in facts)
+                    exc = UploadError("Studio upload response did not contain the required transfer proof",
+                                      stage="studio transfer", diagnostics=facts)
                 self.error = exc
 
+    def _apply(self, file_type: str, data, facts: dict):
+        nodes = data["Result"]["InnerUploadAddress"]["UploadNodes"]
+        if not isinstance(nodes, list):
+            raise _NativeRejected("node_list_invalid")
+        facts["nodes"] = len(nodes)
+        facts.update(_node_counts(nodes))
+        if not 1 <= len(nodes) <= MAX_UPLOAD_NODES:
+            raise _NativeRejected("node_count_invalid")
+        video = file_type == "video"
+        candidates, keys, vids, storage = set(), set(), set(), set()
+        unkeyed = False
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise _NativeRejected("node_invalid")
+            try:
+                storage.update(self.gate.storage_for(node))
+            except (KeyError, TypeError, ValueError):
+                raise _NativeRejected("storage_invalid") from None
+            key, vid = node.get("SessionKey"), node.get("Vid")
+            if video:
+                try:
+                    key = _upload_string(key, 8192)
+                except ValueError:
+                    raise _NativeRejected("session_key_invalid") from None
+                try:
+                    vid = _upload_string(vid, 256)
+                except ValueError:
+                    raise _NativeRejected("vid_invalid") from None
+                candidates.add((key, vid))
+                continue
+            # Auxiliary uploads, such as the cover image, may carry empty
+            # identities. They are tracked only so their commits cannot be
+            # confused with the video; they can never select media_id.
+            if key is None or key == "":
+                unkeyed = True
+            else:
+                try:
+                    keys.add(_upload_string(key, 8192))
+                except ValueError:
+                    raise _NativeRejected("session_key_invalid") from None
+            if vid is not None and not isinstance(vid, str):
+                raise _NativeRejected("vid_invalid")
+            if vid:
+                try:
+                    vids.add(_upload_string(vid, 256))
+                except ValueError:
+                    raise _NativeRejected("vid_invalid") from None
+        video_keys = {key for key, _ in self.video_candidates | candidates}
+        video_vids = {vid for _, vid in self.video_candidates | candidates}
+        aux_keys, aux_vids = self.aux_keys | keys, self.aux_vids | vids
+        if (len(self.video_candidates | candidates) > MAX_UPLOAD_NODES or len(aux_keys) > MAX_UPLOAD_NODES
+                or len(aux_vids) > MAX_UPLOAD_NODES
+                or len(self.gate.storage_paths | storage) > MAX_UPLOAD_NODES * MAX_STORE_INFOS):
+            raise _NativeRejected("limit_exceeded")
+        if video_keys & aux_keys or video_vids & aux_vids:
+            raise _NativeRejected("identity_conflict")
+        # Validate the complete authenticated response before extending
+        # transfer permissions. Node order never selects the video.
+        self.video_candidates.update(candidates)
+        self.aux_keys, self.aux_vids = aux_keys, aux_vids
+        self.aux_unkeyed = self.aux_unkeyed or unkeyed
+        self.gate.storage_paths.update(storage)
+
+    def _commit(self, request, data, facts: dict):
+        try:
+            key = request.post_data_json["SessionKey"]
+        except (KeyError, TypeError, ValueError):
+            key = None
+        result = data.get("Result") if isinstance(data, dict) else None
+        results = result.get("Results") if isinstance(result, dict) else None
+        facts["results"] = len(results) if isinstance(results, list) else 0
+        video_vids = {vid for _, vid in self.video_candidates}
+        if (key in (None, "") and self.aux_unkeyed) or (isinstance(key, str) and key in self.aux_keys):
+            if isinstance(key, str) and key in {k for k, _ in self.video_candidates}:
+                raise _NativeRejected("identity_conflict")
+            # A known auxiliary commit is never video proof, but it must not
+            # name the video either.
+            if isinstance(results, list) and any(isinstance(item, dict) and item.get("Vid") in video_vids
+                                                 for item in results[:MAX_UPLOAD_NODES]):
+                raise _NativeRejected("commit_identity_ambiguous")
+            return
+        try:
+            key = _upload_string(key, 8192)
+        except ValueError:
+            raise _NativeRejected("commit_session_invalid") from None
+        if not isinstance(results, list) or not 1 <= len(results) <= MAX_UPLOAD_NODES:
+            raise _NativeRejected("commit_results_invalid")
+        try:
+            identities = {_upload_string(item["Vid"], 256) for item in results}
+        except (KeyError, TypeError, ValueError):
+            raise _NativeRejected("commit_results_invalid") from None
+        if len(identities) != 1:
+            raise _NativeRejected("commit_identity_ambiguous")
+        media_id = identities.pop()
+        if (key, media_id) not in self.video_candidates:
+            raise _NativeRejected("commit_identity_unknown")
+        if self.media_id is not None and self.media_id != media_id:
+            raise _NativeRejected("commit_identity_conflict")
+        self.media_id, self.session_key = media_id, key
+        self.committed = True
 
 class BrowserStudioClient:
     def __init__(self, account: Account, *, expected_remote_account_id: str, timeout=20, guard=None, label: str = ""):

@@ -357,7 +357,7 @@ class Worker:
             detail = ""
             if isinstance(exc, UploadError):
                 detail = f" stage={exc.stage!r} status={exc.status} provider_code={exc.provider_code} retry_after_seconds={exc.retry_after_seconds}"
-                detail += f" response_kind={exc.diagnostics.get('response_kind')} request_id_tag={exc.diagnostics.get('request_id_tag')}"
+                detail += f" response_kind={exc.diagnostics.get('response_kind')} request_id_tag={exc.diagnostics.get('request_id_tag')} native={exc.diagnostics.get('native')}"
             log.warning("upload failed %s phase=%s error_type=%s%s", context, journal["phase"], type(exc).__name__, detail)
         finally:
             if prepared:
