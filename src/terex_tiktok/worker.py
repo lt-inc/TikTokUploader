@@ -222,7 +222,7 @@ class Worker:
                         raise
                 log.info("media download complete %s size_bytes=%s", context, size)
                 account = Account(name=f"account-{journal['account_id']}", cookies=row["cookies"], user_agent=row["user_agent"], proxy=proxy_url)
-                uploader = (BrowserStudioClient(account, timeout=20, guard=guard,
+                uploader = (BrowserStudioClient(account, timeout=20, guard=guard, label=context,
                                                expected_remote_account_id=journal["remote_account_id"])
                             if studio else Client(account, timeout=20, guard=guard))
                 with STAGES.labels("prepare").time():
@@ -238,13 +238,20 @@ class Worker:
                     self._checkpoint(lease, journal, "uploading")
                     TRANSFER.labels("upload").inc(size)
                     log.info("upload transfer complete %s size_bytes=%s", context, size)
+                waited = []
+                def processing():
+                    # Checkpoint "processing" once for the whole browser wait.
+                    if not waited:
+                        waited.append(True)
+                        self._checkpoint(lease, journal, "processing")
                 if self.browser_help and not studio:
                     # Keep the transferred project while the operator solves
                     # any device/CAPTCHA check in this very browser.
-                    row = self.browser_help.verify_for_publish(row, guard, lambda: self._checkpoint(lease, journal, "processing"))
+                    row = self.browser_help.verify_for_publish(row, guard, processing, context)
                     for cookie in row["cookies"]:
                         prepared["session"].cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path", "/"))
-                with STAGES.labels("prepare_publish").time(), (nullcontext() if studio else browser_permit()):
+                with STAGES.labels("prepare_publish").time(), (nullcontext() if studio else
+                        browser_permit(guard=guard, on_wait=processing, label=context)):
                     uploader.prepare_publish(prepared)
                 def barrier():
                     nonlocal external_started

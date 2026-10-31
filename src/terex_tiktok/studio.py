@@ -159,7 +159,7 @@ class _PublishGate:
 
 
 class _StudioSession:
-    def __init__(self, account: Account, prepared: dict, guard, timeout: float):
+    def __init__(self, account: Account, prepared: dict, guard, timeout: float, label: str = "", wait_guard=None):
         self.stack = ExitStack()
         self.guard, self.prepared, self.timeout = guard, prepared, timeout
         self.gate = _PublishGate(prepared, self._request_guard)
@@ -170,7 +170,7 @@ class _StudioSession:
         self.result = None
         self.closed = False
         try:
-            self.stack.enter_context(browser_permit())
+            self.stack.enter_context(browser_permit(guard=wait_guard, label=label))
             pw = self.stack.enter_context(sync_playwright())
             browser = launch_chromium(pw, headless=True, proxy=account.get_proxy())
             self.stack.callback(browser.close)
@@ -306,8 +306,9 @@ class _StudioSession:
 
 
 class BrowserStudioClient:
-    def __init__(self, account: Account, *, expected_remote_account_id: str, timeout=20, guard=lambda: None):
-        self.account, self.timeout, self.guard = account, timeout, guard
+    def __init__(self, account: Account, *, expected_remote_account_id: str, timeout=20, guard=None, label: str = ""):
+        self.account, self.timeout, self.guard, self.label = account, timeout, guard or (lambda: None), label
+        self.browser_wait_guard = guard
         self.expected_remote_account_id = expected_remote_account_id
 
     def prepare(self, video, caption, *, creation_id=None, visibility="private", allow_comment=True,
@@ -324,7 +325,7 @@ class BrowserStudioClient:
             raise ValidationError("video must be a non-empty file")
         prepared = {"path": path, "caption": caption, "visibility": _visibility(visibility),
                     "allow_comment": allow_comment, "allow_duet": allow_duet, "allow_stitch": allow_stitch}
-        session = _StudioSession(self.account, prepared, self.guard, self.timeout)
+        session = _StudioSession(self.account, prepared, self.guard, self.timeout, self.label, self.browser_wait_guard)
         prepared["session"] = session
         try:
             session.page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=self.timeout * 1000)

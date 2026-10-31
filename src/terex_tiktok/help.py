@@ -66,13 +66,13 @@ class BrowserHelp:
                     raise ValueError("Account connection changed; browser help closed")
             return session
 
-    def verify_for_publish(self, row: dict, guard, on_wait) -> dict:
+    def verify_for_publish(self, row: dict, guard, on_wait, label: str = "") -> dict:
         """Pre-submit device checks keep the already transferred media intact.
 
         Browser operations stay on the publishing thread. HTTP helpers only
         signal finish/stop; they never call Playwright on a foreign thread.
         """
-        with browser_permit(), sync_playwright() as pw:
+        with browser_permit(guard=guard, on_wait=on_wait, label=label), sync_playwright() as pw:
             browser, context = open_context(pw, row, proxy_for(row, self.config), headless=False)
             token = None
             try:
