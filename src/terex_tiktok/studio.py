@@ -29,6 +29,14 @@ PROJECT_PREPARATION_PATHS = {
     "/api/v1/web/project/create", "/api/v1/web/project/update", "/api/v1/web/project/save",
     "/tiktok/web/project/create/v1", "/tiktok/web/project/update/v1", "/tiktok/web/project/save/v1",
 }
+MAX_UPLOAD_NODES = 16
+MAX_STORE_INFOS = 16
+
+
+def _upload_string(value, limit: int) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= limit or any(ord(c) <= 32 or ord(c) == 127 for c in value):
+        raise ValueError("Invalid upload identity or address")
+    return value
 
 
 def _tiktok_host(host: str | None) -> bool:
@@ -93,19 +101,25 @@ class _PublishGate:
         self.error: Exception | None = None
         self.storage_paths: set[tuple[str, str]] = set()
 
-    def allow_storage(self, node: dict):
-        host = node.get("UploadHost")
-        if not isinstance(host, str) or not host or "/" in host or "@" in host:
+    @staticmethod
+    def storage_for(node: dict) -> set[tuple[str, str]]:
+        host = _upload_string(node["UploadHost"], 253)
+        if any(c in host for c in "/@\\"):
             raise ValueError("Invalid upload host")
         address = urlparse("https://" + host)
         if (address.netloc != host or address.query or address.fragment or address.port is not None
-                or _tiktok_host(address.hostname)):
+                or not address.hostname or _tiktok_host(address.hostname)):
             raise ValueError("Invalid upload storage origin")
-        for item in node["StoreInfos"]:
-            uri = item["StoreUri"]
-            if not isinstance(uri, str) or "?" in uri or "#" in uri:
+        infos = node["StoreInfos"]
+        if not isinstance(infos, list) or not 1 <= len(infos) <= MAX_STORE_INFOS:
+            raise ValueError("Invalid storage entries")
+        paths = set()
+        for item in infos:
+            uri = _upload_string(item["StoreUri"], 2048)
+            if any(c in uri for c in "?#\\") or any(part in (".", "..") for part in uri.split("/")) or not uri.lstrip("/"):
                 raise ValueError("Invalid storage URI")
-            self.storage_paths.add((host.lower(), "/" + uri.lstrip("/")))
+            paths.add((host.lower(), "/" + uri.lstrip("/")))
+        return paths
 
     def _allowed_preparation(self, request) -> bool:
         if request.method in ("GET", "HEAD", "OPTIONS"):
@@ -167,6 +181,8 @@ class _StudioSession:
         self.error = None
         self.media_id = None
         self.session_key = None
+        self.video_candidates: set[tuple[str, str]] = set()
+        self.other_candidates: set[tuple[str, str]] = set()
         self.committed = False
         self.result = None
         self.closed = False
@@ -325,22 +341,38 @@ class _StudioSession:
                 raise failure
             if action == "ApplyUploadInner":
                 nodes = data["Result"]["InnerUploadAddress"]["UploadNodes"]
+                if not isinstance(nodes, list) or not 1 <= len(nodes) <= MAX_UPLOAD_NODES:
+                    raise ValueError
+                candidates, storage = set(), set()
                 for node in nodes:
-                    self.gate.allow_storage(node)
-                if query.get("FileType", [None])[0] != "video":
-                    return
-                if len(nodes) != 1 or not nodes[0]["Vid"] or not nodes[0]["SessionKey"]:
+                    candidates.add((_upload_string(node["SessionKey"], 8192), _upload_string(node["Vid"], 256)))
+                    storage.update(self.gate.storage_for(node))
+                target = self.video_candidates if query.get("FileType", [None])[0] == "video" else self.other_candidates
+                if (len(target | candidates) > MAX_UPLOAD_NODES
+                        or len(self.gate.storage_paths | storage) > MAX_UPLOAD_NODES * MAX_STORE_INFOS
+                        or (candidates & (self.other_candidates if target is self.video_candidates else self.video_candidates))):
                     raise ValueError
-                media_id = str(nodes[0]["Vid"])
-                if self.media_id is not None and self.media_id != media_id:
-                    raise UploadError("Studio returned more than one video upload", stage="studio apply")
-                self.media_id, self.session_key = media_id, nodes[0]["SessionKey"]
+                # Validate the complete authenticated response before extending
+                # transfer permissions. Node order never selects the video.
+                target.update(candidates)
+                self.gate.storage_paths.update(storage)
             else:
-                if not self.media_id or response.request.post_data_json.get("SessionKey") != self.session_key:
-                    return
+                session_key = _upload_string(response.request.post_data_json["SessionKey"], 8192)
                 results = data["Result"]["Results"]
-                if not any(str(item.get("Vid")) == self.media_id for item in results if isinstance(item, dict)):
+                if not isinstance(results, list) or not 1 <= len(results) <= MAX_UPLOAD_NODES:
                     raise ValueError
+                identities = {_upload_string(item["Vid"], 256) for item in results}
+                if len(identities) != 1:
+                    raise ValueError
+                media_id = identities.pop()
+                candidate = (session_key, media_id)
+                if candidate in self.other_candidates:
+                    return  # Known auxiliary media cannot select the video.
+                if candidate not in self.video_candidates:
+                    raise ValueError
+                if self.media_id is not None and self.media_id != media_id:
+                    raise UploadError("Studio committed more than one video identity", stage="studio commit")
+                self.media_id, self.session_key = media_id, session_key
                 self.committed = True
         except Exception as exc:
             if self.error is None:
