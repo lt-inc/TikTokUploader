@@ -756,10 +756,19 @@ class BrowserStudioClient:
             raise UploadError("Studio did not retain the exact caption", stage="studio metadata")
         label = "Only you" if prepared["visibility"] == 1 else "Everyone"
         dropdown = page.locator("[data-e2e='video_visibility_container'] button[role='combobox']")
-        dropdown.click(timeout=self.timeout * 1000)
-        page.get_by_role("option", name=label, exact=True).click(timeout=self.timeout * 1000)
-        if label not in dropdown.inner_text():
-            raise UploadError("Studio did not confirm the selected privacy", stage="studio privacy")
+        try:
+            # Retain an already confirmed value; opening its dialog needlessly
+            # can race the Studio upload transition. The final native payload
+            # must still prove the requested privacy before any send.
+            if label not in dropdown.inner_text(timeout=self.timeout * 1000):
+                dropdown.click(timeout=self.timeout * 1000)
+                page.get_by_role("option", name=label, exact=True).click(timeout=self.timeout * 1000)
+            if label not in dropdown.inner_text(timeout=self.timeout * 1000):
+                raise UploadError("Studio did not confirm the selected privacy", stage="studio privacy")
+        except UploadError:
+            raise
+        except Exception as exc:
+            raise UploadError("Studio privacy control was unavailable", stage="studio privacy") from exc
         for label, key in (("Comment", "allow_comment"), ("Duet", "allow_duet"), ("Stitch", "allow_stitch")):
             control = page.locator(f"xpath=//label[.='{label}']/following-sibling::div/input")
             if control.count() == 1 and control.is_visible():
