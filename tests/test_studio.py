@@ -621,3 +621,94 @@ def test_local_chromium_first_mutation_proxy_auth_and_unknown_redirect(monkeypat
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.skipif(os.environ.get("TIKTOK_STUDIO_BROWSER_TESTS") != "1", reason="Opt-in local Chromium fixture; no TikTok requests")
+def test_local_chromium_storage_upload_immediately_after_apply_is_registered_first(monkeypatch):
+    """The SDK may POST storage the moment Apply resolves, before Playwright response callbacks run."""
+    received, challenges = [], []
+    proxy_auth = "Basic " + base64.b64encode(b"fixture:fixture").decode("ascii")
+    node = {"Vid": "video-1", "SessionKey": "upload-session-1", "UploadHost": "storage.invalid",
+            "StoreInfos": [{"StoreUri": "tos-fixture/object"}]}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, status=200, body=b"", authenticate=None):
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "http://studio.invalid")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Content-Length", str(len(body)))
+            if authenticate:
+                self.send_header(*authenticate)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_CONNECT(self):
+            self.reply(403)
+
+        def do_GET(self):
+            target = urlparse(self.path)
+            if target.netloc != "studio.invalid":
+                return self.reply(403)
+            if "ApplyUploadInner" in target.query:
+                return self.reply(body=json.dumps({"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}).encode())
+            self.reply()
+
+        def do_POST(self):
+            target = urlparse(self.path)
+            if target.netloc != "storage.invalid":
+                return self.reply(403)
+            if self.headers.get("Proxy-Authorization") != proxy_auth:
+                challenges.append(self.command)
+                return self.reply(407, authenticate=("Proxy-Authenticate", 'Basic realm="storage"'))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.append(target.path + ("?" + target.query if target.query else ""))
+            self.reply()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    account = Account("fixture", cookies=[{"name": "sessionid", "value": "fixture-only", "domain": ".tiktok.com", "path": "/"}],
+                      proxy=f"http://fixture:fixture@127.0.0.1:{server.server_port}")
+    original_origin = studio._studio_origin
+    original_preparation = studio._PublishGate._allowed_preparation
+    monkeypatch.setattr(studio, "_studio_origin", lambda url: url.startswith("http://studio.invalid/") or original_origin(url))
+    def preparation(gate, request):
+        if request.url.startswith("http://storage.invalid/"):
+            request = SimpleNamespace(method=request.method, url=request.url.replace("http://", "https://", 1))
+        return original_preparation(gate, request)
+    monkeypatch.setattr(studio._PublishGate, "_allowed_preparation", preparation)
+    original_on_response = studio._StudioSession.on_response
+    def delayed_on_response(session, response):
+        # Reproduces slow asynchronous response handling around the Playwright round trip.
+        if "ApplyUploadInner" in response.url:
+            session.page.wait_for_timeout(750)
+        original_on_response(session, response)
+    monkeypatch.setattr(studio._StudioSession, "on_response", delayed_on_response)
+    session = None
+    try:
+        session = studio._StudioSession(account, {}, lambda: None, 4)
+        assert session.page.goto("http://studio.invalid/", timeout=4000).status == 200
+        results = session.page.evaluate("""async () => {
+            const apply = await (await fetch('/top/v1?Action=ApplyUploadInner&FileType=video')).json();
+            const n = apply.Result.InnerUploadAddress.UploadNodes[0];
+            const url = 'http://' + n.UploadHost + '/upload/v1/' + n.StoreInfos[0].StoreUri;
+            const out = [];
+            for (const target of [url, url + '-other']) {
+                try { out.push((await fetch(target, {method: 'POST', body: 'x', credentials: 'include'})).status); }
+                catch { out.push('blocked'); }
+            }
+            return out;
+        }""")
+        assert results == [200, "blocked"]
+        assert received == ["/upload/v1/tos-fixture/object"] and challenges == ["POST"]
+        assert session.error is None and session.gate.blocked_storage_requests == 1
+        assert session.apply_intercepted == 1 and session.video_candidates == {("upload-session-1", "video-1")}
+        assert "tos-fixture" not in session.gate.blocked_shape and "path_known=0" in session.gate.blocked_shape
+    finally:
+        if session:
+            session.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

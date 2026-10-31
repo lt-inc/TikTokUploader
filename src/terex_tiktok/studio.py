@@ -6,6 +6,8 @@ and redirects are never evidence that a post exists.
 """
 from __future__ import annotations
 
+import base64
+import json
 import time
 from contextlib import ExitStack
 from dataclasses import replace
@@ -31,6 +33,7 @@ PROJECT_PREPARATION_PATHS = {
 }
 MAX_UPLOAD_NODES = 16
 MAX_STORE_INFOS = 16
+MAX_APPLY_BODY = 1 << 20
 _NATIVE_FACTS = ("action", "file_type", "reason", "nodes", "empty_vid", "empty_key", "invalid_store", "results")
 
 
@@ -121,7 +124,7 @@ class _PublishGate:
         self.error: Exception | None = None
         self.storage_paths: set[tuple[str, str]] = set()
         self.blocked_storage_requests = 0
-
+        self.blocked_shape = ""
     @staticmethod
     def storage_for(node: dict) -> set[tuple[str, str]]:
         host = _upload_string(node["UploadHost"], 253)
@@ -141,6 +144,16 @@ class _PublishGate:
                 raise ValueError("Invalid storage URI")
             paths.add((host.lower(), "/" + uri.lstrip("/")))
         return paths
+
+    def _storage_shape(self, request) -> str:
+        # Booleans and counts only: never the host, path, query or any identifier.
+        parts = urlparse(request.url)
+        path = parts.path[len("/upload/v1"):] if parts.path.startswith("/upload/v1/") else parts.path
+        method = request.method if request.method in ("GET", "HEAD", "OPTIONS", "POST", "PUT", "DELETE", "PATCH") else "other"
+        host = parts.netloc.lower()
+        return (f"method={method} query={int(bool(parts.query))} native_prefix={int(parts.path.startswith('/upload/v1/'))} "
+                f"segments={min(len([s for s in path.split('/') if s]), 9)} encoded={int('%' in parts.path)} "
+                f"path_known={int((host, path) in self.storage_paths)} known_paths={min(len(self.storage_paths), 999)}")
 
     def _allowed_preparation(self, request) -> bool:
         if request.method in ("GET", "HEAD", "OPTIONS"):
@@ -175,6 +188,7 @@ class _PublishGate:
                 else:
                     if urlparse(request.url).netloc.lower() in {host for host, _ in self.storage_paths}:
                         self.blocked_storage_requests = min(1000, self.blocked_storage_requests + 1)
+                        self.blocked_shape = self._storage_shape(request)
                     # Unknown mutations, including a changed publication API,
                     # never leave the browser. Dropped telemetry is harmless.
                     route.abort("blockedbyclient")
@@ -202,6 +216,10 @@ class _PublishGate:
 
 
 class _StudioSession:
+    # Class defaults keep browserless unit fixtures on the Playwright callback path.
+    cdp_apply = False
+    apply_intercepted = 0
+
     def __init__(self, account: Account, prepared: dict, guard, timeout: float, label: str = "", wait_guard=None):
         self.stack = ExitStack()
         self.guard, self.prepared, self.timeout = guard, prepared, timeout
@@ -246,6 +264,7 @@ class _StudioSession:
             self.cdp.on("Fetch.authRequired", self.on_auth_required)
             self.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}],
                                            "handleAuthRequests": True})
+            self.cdp_apply = True
         except BaseException:
             self.close()
             raise
@@ -283,7 +302,8 @@ class _StudioSession:
         if self.gate.used:
             raise PublishUncertainError(message + "; the native publish request may have succeeded")
         raise UploadError(message, stage="studio wait", diagnostics={
-            "native": f"reason=wait_timeout blocked_storage={self.gate.blocked_storage_requests}"})
+            "native": (f"reason=wait_timeout blocked_storage={self.gate.blocked_storage_requests} "
+                       f"apply_cdp={self.apply_intercepted} {self.gate.blocked_shape}").strip()})
 
     def on_request_failed(self, request):
         if request == self.gate.request and self.error is None:
@@ -324,9 +344,21 @@ class _StudioSession:
         request = event["request"]
         mutation = request["method"] not in ("GET", "HEAD", "OPTIONS")
         response_stage = "responseStatusCode" in event or "responseErrorReason" in event
+        observed = self._upload_action(request["url"])
+        apply = observed[1] if observed and observed[0] == "ApplyUploadInner" else None
         try:
             if not response_stage:
-                self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"], "interceptResponse": mutation})
+                self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"],
+                                                        "interceptResponse": mutation or apply is not None})
+            elif apply is not None and "responseStatusCode" in event and not (300 <= event["responseStatusCode"] < 400):
+                # The SDK may start native storage immediately after reading
+                # Apply, before any asynchronous Playwright response callback.
+                # Register the validated response in-process, then release it.
+                self._intercept_apply(event, apply)
+                if self.error is not None:
+                    self.cdp.send("Fetch.failRequest", {"requestId": event["requestId"], "errorReason": "BlockedByClient"})
+                else:
+                    self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]})
             elif mutation and 300 <= event.get("responseStatusCode", 0) < 400:
                 if self.error is None:
                     self.error = (PublishUncertainError("A redirect after Studio publication was blocked; inspect the account")
@@ -339,8 +371,20 @@ class _StudioSession:
                 self.error = (PublishUncertainError("Studio response interception failed after publication") if self.gate.used
                               else UploadError("Studio response interception failed", stage="studio redirect guard"))
 
+    @staticmethod
+    def _upload_action(url: str):
+        """Return (action, file_type) for a native Studio upload RPC, else None."""
+        parts = urlparse(url)
+        if not _studio_origin(url) or parts.path.rstrip("/") != "/top/v1":
+            return None
+        query = parse_qs(parts.query)
+        action = query.get("Action", [None])[0]
+        if action not in ("ApplyUploadInner", "CommitUploadInner"):
+            return None
+        file_type = query.get("FileType", [None])[0]
+        return action, (file_type if file_type in ("video", "image") else "other")
+
     def on_response(self, response):
-        action, file_type, facts = None, "other", {}
         try:
             if response.request == self.gate.request:
                 if 300 <= response.status < 400 or response.status >= 500:
@@ -354,40 +398,72 @@ class _StudioSession:
                     raise PublishError("TikTok rejected the native Studio post", status_code=data["status_code"])
                 self.result = data
                 return
-            parts = urlparse(response.url)
-            if not _studio_origin(response.url) or parts.path.rstrip("/") != "/top/v1":
-                return
-            query = parse_qs(parts.query)
-            action = query.get("Action", [None])[0]
-            if action not in ("ApplyUploadInner", "CommitUploadInner"):
-                return
-            file_type = query.get("FileType", [None])[0]
-            file_type = file_type if file_type in ("video", "image") else "other"
+        except Exception as exc:
+            if self.error is None:
+                if not isinstance(exc, (PublishError, PublishUncertainError)):
+                    exc = PublishUncertainError("The native Studio publication response could not be verified")
+                self.error = exc
+            return
+        observed = self._upload_action(response.url)
+        if observed is None:
+            return
+        action, file_type = observed
+        # CDP already validated and registered Apply before page JS saw it.
+        if action == "ApplyUploadInner" and self.cdp_apply:
+            return
+
+        def read():
             try:
                 data = response.json()
             except Exception:
                 data = None
-            diagnostic = SimpleNamespace(status_code=response.status, headers=CaseInsensitiveDict(response.headers),
-                                         text=response.text(), json=lambda: data)
+            return response.text(), data
+        self._observe_upload(action, file_type, response.status, response.headers, read, response.request)
+
+    def _observe_upload(self, action: str, file_type: str, status: int, headers, read, request):
+        facts = {}
+        try:
+            text, data = read()
+            diagnostic = SimpleNamespace(status_code=status, headers=CaseInsensitiveDict(headers), text=text,
+                                         json=lambda: data)
             facts = upload_diagnostics(diagnostic, payload=data)
             failure = UploadError.from_response("studio " + action, diagnostic, payload=data)
-            if response.status != 200 or failure.provider_code not in (None, 0) or failure.rate_limited:
+            if status != 200 or failure.provider_code not in (None, 0) or failure.rate_limited:
                 raise failure
             if action == "ApplyUploadInner":
                 self._apply(file_type, data, facts)
             else:
-                self._commit(response.request, data, facts)
+                self._commit(request, data, facts)
         except Exception as exc:
             if self.error is None:
-                if response.request == self.gate.request and not isinstance(exc, (PublishError, PublishUncertainError)):
-                    exc = PublishUncertainError("The native Studio publication response could not be verified")
-                elif not isinstance(exc, (UploadError, PublishError, PublishUncertainError)):
+                if not isinstance(exc, (UploadError, PublishError, PublishUncertainError)):
                     reason = exc.reason if isinstance(exc, _NativeRejected) else "malformed_response"
                     facts.update(reason=reason, action=(action or "other").removesuffix("UploadInner").lower(), file_type=file_type)
                     facts["native"] = " ".join(f"{key}={facts[key]}" for key in _NATIVE_FACTS if key in facts)
                     exc = UploadError("Studio upload response did not contain the required transfer proof",
                                       stage="studio transfer", diagnostics=facts)
                 self.error = exc
+
+    def _intercept_apply(self, event, file_type: str):
+        """Validate and register an Apply response before the page can read it."""
+        def read():
+            body = self.cdp.send("Fetch.getResponseBody", {"requestId": event["requestId"]})
+            raw = body.get("body", "")
+            if not isinstance(raw, str) or len(raw) > MAX_APPLY_BODY:
+                raise _NativeRejected("response_too_large")
+            if body.get("base64Encoded"):
+                raw = base64.b64decode(raw, validate=True).decode("utf-8")
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
+            return raw, data
+        headers = {}
+        for item in event.get("responseHeaders") or ():
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                headers[item["name"]] = str(item.get("value", ""))
+        self.apply_intercepted = min(1000, self.apply_intercepted + 1)
+        self._observe_upload("ApplyUploadInner", file_type, event["responseStatusCode"], headers, read, None)
 
     def _apply(self, file_type: str, data, facts: dict):
         if file_type not in ("video", "image"):
