@@ -44,6 +44,60 @@ class Route:
         self.aborted += 1
 
 
+@pytest.mark.parametrize("url,method,allowed", [
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", True),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/other", "POST", False),
+    ("https://other.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?delete=1", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object", "PUT", False),
+    ("http://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=up-1&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/other?uploadid=up-1&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "POST", True),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789ABC&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=other", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web&", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web#x", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "PUT", False),
+    ("http://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "POST", False),
+])
+def test_native_single_post_is_bound_to_allocated_storage_object(url, method, allowed):
+    gate = studio._PublishGate(prepared(), lambda: None)
+    gate.storage_paths.add(("storage.tiktokcdn.com", "/bucket/object"))
+    gate.storage_uploads[("storage.tiktokcdn.com", "/bucket/object")] = {"up-1"}
+    route = Route(url=url, method=method)
+    gate.route(route)
+    assert bool(route.continued) is allowed
+    assert not gate.used and gate.error is None
+
+
+def test_native_storage_id_is_pinned_only_on_admission_and_request_count_is_bounded(monkeypatch):
+    monkeypatch.setattr(studio, "MAX_NATIVE_STORAGE_REQUESTS", 2)
+    gate = studio._PublishGate(prepared(), lambda: None)
+    key = ("storage.tiktokcdn.com", "/bucket/object")
+    gate.storage_paths.add(key)
+    url = "https://storage.tiktokcdn.com/upload/v1/bucket/object?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc"
+    first = Route(url=url)
+    for _ in range(3):
+        assert gate._allowed_preparation(first.request)
+    assert not gate.native_storage_requests and not gate.native_upload_ids
+    gate.route(first)
+    assert first.continued == 1 and gate.native_storage_requests[key] == 1
+    changed = Route(url=url.replace("123456789abc", "123456789abd"))
+    gate.route(changed)
+    assert changed.aborted == 1 and gate.native_storage_requests[key] == 1
+    second = Route(url=url)
+    gate.route(second)
+    assert second.continued == 1 and gate.native_storage_requests[key] == 2
+    capped = Route(url=url)
+    gate.route(capped)
+    assert capped.aborted == 1 and not capped.continued
+    assert isinstance(gate.error, UploadError) and gate.error.diagnostics["native"] == "reason=cap_exceeded"
+    assert not gate.armed and not gate.used
+
+
 def test_unarmed_publish_and_following_valid_request_never_reach_network():
     gate = studio._PublishGate(prepared(), lambda: None)
     first = Route()
@@ -142,12 +196,13 @@ def session_without_browser():
     session.error = session.media_id = session.session_key = session.result = None
     session.committed = False
     session.video_candidates = set()
-    session.other_candidates = set()
+    session.aux_keys, session.aux_vids = set(), set()
+    session.video_storage = {}
     return session
 
 
-def native_response(action, payload=None, *, status=200, headers=None, request_payload=None):
-    url = f"https://www.tiktok.com/top/v1?Action={action}&FileType=video"
+def native_response(action, payload=None, *, status=200, headers=None, request_payload=None, file_type="video"):
+    url = f"https://www.tiktok.com/top/v1?Action={action}&FileType={file_type}"
     def parse():
         if payload is None:
             raise ValueError("non-JSON")
@@ -207,6 +262,68 @@ def test_commit_requires_one_known_identity_and_never_permits_conflicting_video(
     assert not route.continued and not session.gate.used
 
 
+def image_apply(session, vid="", key="image-key"):
+    node = {"Vid": vid, "SessionKey": key, "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "cover/image"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}},
+                                        file_type="image"))
+
+
+def video_apply(session):
+    node = {"Vid": "video-1", "SessionKey": "key-1", "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "v/video"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node, node]}}}))
+
+
+def test_empty_image_vid_is_auxiliary_and_only_video_commit_sets_media_id():
+    session = session_without_browser()
+    video_apply(session)
+    image_apply(session)
+    assert session.error is None and session.media_id is None
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": ""}]}},
+                                        request_payload={"SessionKey": "image-key"}))
+    assert session.error is None and session.media_id is None and not session.committed
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
+                                        request_payload={"SessionKey": "key-1"}))
+    assert session.error is None and session.committed and session.media_id == "video-1"
+
+
+def test_empty_video_vid_is_still_rejected_with_bounded_diagnostics():
+    session = session_without_browser()
+    node = {"Vid": "", "SessionKey": "secret-key", "UploadHost": "storage.tiktokcdn.com", "StoreInfos": [{"StoreUri": "v/video"}]}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}))
+    assert isinstance(session.error, UploadError) and not session.video_candidates and not session.gate.storage_paths
+    facts = session.error.diagnostics
+    assert facts["reason"] == "vid_invalid" and facts["empty_vid"] == 1 and facts["file_type"] == "video"
+    assert "secret-key" not in facts["native"] and "tiktokcdn" not in facts["native"]
+
+
+@pytest.mark.parametrize("case", ["unknown_key", "image_names_video", "key_collision", "vid_collision", "unknown_empty_key", "image_empty_key"])
+def test_auxiliary_commits_never_select_video_and_ambiguity_fails_closed(case):
+    session = session_without_browser()
+    video_apply(session)
+    if case == "key_collision":
+        image_apply(session, key="key-1")
+    elif case == "vid_collision":
+        image_apply(session, vid="video-1")
+    elif case == "image_empty_key":
+        image_apply(session, key="")
+        assert isinstance(session.error, UploadError) and session.error.diagnostics["reason"] == "session_key_invalid"
+        return
+    else:
+        image_apply(session)
+    key, results = "image-key", [{"Vid": ""}]
+    if case == "unknown_key":
+        key = "other-key"
+    elif case == "image_names_video":
+        results = [{"Vid": "video-1"}]
+    elif case == "unknown_empty_key":
+        key = ""
+    elif case in ("key_collision", "vid_collision"):
+        assert isinstance(session.error, UploadError) and session.error.diagnostics["reason"] == "identity_conflict"
+        return
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": results}}, request_payload={"SessionKey": key}))
+    assert isinstance(session.error, UploadError) and session.media_id is None and not session.committed
+
+
 @pytest.mark.parametrize("case", ["too_many", "bad_identity", "bad_path", "bad_host"])
 def test_invalid_apply_does_not_partially_grant_storage_permissions(case):
     session = session_without_browser()
@@ -223,6 +340,156 @@ def test_invalid_apply_does_not_partially_grant_storage_permissions(case):
     session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": nodes}}}))
     assert isinstance(session.error, UploadError)
     assert not session.gate.storage_paths and not session.video_candidates and session.media_id is None
+
+
+STORAGE_HOST = "storage.tiktokcdn.com"
+UPLOAD_UUID = "12345678-1234-4234-8234-123456789abc"
+
+
+def two_video_apply(session):
+    nodes = [{"Vid": f"video-{n}", "SessionKey": f"key-{n}", "UploadHost": STORAGE_HOST,
+              "StoreInfos": [{"StoreUri": f"v/object-{n}"}]} for n in (1, 2)]
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": nodes}}}))
+    assert session.error is None
+
+
+def admit_storage(session, path, host=STORAGE_HOST):
+    route = Route(url=f"https://{host}/upload/v1/{path}?uploadid={UPLOAD_UUID}&device_platform=web")
+    session.gate.route(route)
+    return route
+
+
+def storage_response(path, vid="video-2", *, host=STORAGE_HOST, status=200, code=2000, request_id="r" * 34,
+                     meta=None, results=None, data=None):
+    video_meta = {"Uri": "m" * 56, "Height": 1280, "Width": 720, "OriginHeight": 1280, "OriginWidth": 720,
+                  "Duration": 5, "Bitrate": 1000, "Format": "mp4", "Size": 12345, "FileType": "video", "Codec": "h264"}
+    video_meta.update(meta or {})
+    body = data if data is not None else {
+        "file_info": {"crc32": "abcdef12"},
+        "post_upload_resp": {"request_id": request_id, "multi_callback_args": [""], "plugin_results": [None],
+                             "results": [{"vid": vid, "video_meta": video_meta}] if results is None else results}}
+    payload = {"apiversion": "1", "code": code, "data": body, "message": "Success"}
+    url = f"https://{host}/upload/v1/{path}?uploadid={UPLOAD_UUID}&device_platform=web"
+    return SimpleNamespace(url=url, request=SimpleNamespace(url=url, method="POST", post_data_json=None), status=status,
+                           headers={}, json=lambda: payload, text=lambda: json.dumps(payload))
+
+
+def test_apply_records_video_storage_identities_and_never_auxiliary_images():
+    session = session_without_browser()
+    two_video_apply(session)
+    image_apply(session)
+    assert session.video_storage == {(STORAGE_HOST, "/v/object-1"): {("key-1", "video-1")},
+                                     (STORAGE_HOST, "/v/object-2"): {("key-2", "video-2")}}
+
+
+@pytest.mark.parametrize("order", ["video_first", "image_first"])
+def test_auxiliary_image_storage_may_not_overlap_video_storage(order):
+    session = session_without_browser()
+    if order == "video_first":
+        video_apply(session)
+    node = {"Vid": "", "SessionKey": "image-key", "UploadHost": STORAGE_HOST, "StoreInfos": [{"StoreUri": "v/video"}]}
+    image = native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}, file_type="image")
+    if order == "video_first":
+        session.on_response(image)
+    else:
+        session.on_response(image)
+        assert session.error is None
+        video_apply(session)
+    assert isinstance(session.error, UploadError)
+    assert ("image-key", "") not in session.video_storage.get((STORAGE_HOST, "/v/video"), set())
+
+
+def test_observed_inline_video_proof_selects_the_exact_candidate_for_its_object():
+    session = session_without_browser()
+    two_video_apply(session)
+    assert admit_storage(session, "v/object-2").continued == 1
+    session.on_response(storage_response("v/object-2", "video-2"))
+    assert session.error is None and session.committed
+    assert session.media_id == "video-2" and session.session_key == "key-2"
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-2"}]}},
+                                        request_payload={"SessionKey": "key-2"}))
+    assert session.error is None and session.media_id == "video-2"
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_vid", "other_object_vid", "unknown_host", "unknown_path", "not_admitted", "wrong_code", "http_500",
+    "bare_crc32", "missing_request_id", "two_results", "no_results", "empty_meta", "image_filetype",
+    "zero_duration", "bool_size", "string_width"])
+def test_inline_storage_response_without_complete_exact_proof_cannot_select_video(case):
+    session = session_without_browser()
+    two_video_apply(session)
+    path, host, kwargs = "v/object-2", STORAGE_HOST, {}
+    if case == "wrong_vid":
+        kwargs["vid"] = "unknown-vid"
+    elif case == "other_object_vid":
+        kwargs["vid"] = "video-1"
+    elif case == "unknown_host":
+        host = "other.tiktokcdn.com"
+    elif case == "unknown_path":
+        path = "v/object-3"
+    elif case == "wrong_code":
+        kwargs["code"] = 2001
+    elif case == "http_500":
+        kwargs["status"] = 500
+    elif case == "bare_crc32":
+        kwargs["data"] = {"crc32": "abcdef12"}
+    elif case == "missing_request_id":
+        kwargs["request_id"] = ""
+    elif case == "two_results":
+        kwargs["results"] = [{"vid": "video-2", "video_meta": {"Duration": 1}}] * 2
+    elif case == "no_results":
+        kwargs["results"] = []
+    elif case == "empty_meta":
+        kwargs["results"] = [{"vid": "video-2", "video_meta": {}}]
+    elif case == "image_filetype":
+        kwargs["meta"] = {"FileType": "image"}
+    elif case == "zero_duration":
+        kwargs["meta"] = {"Duration": 0}
+    elif case == "bool_size":
+        kwargs["meta"] = {"Size": True}
+    elif case == "string_width":
+        kwargs["meta"] = {"Width": "720"}
+    if case not in ("not_admitted", "unknown_host", "unknown_path"):
+        admit_storage(session, path)
+    session.on_response(storage_response(path, host=host, **kwargs))
+    assert session.media_id is None and session.session_key is None and not session.committed
+    if case not in ("not_admitted", "unknown_host", "unknown_path", "bare_crc32"):
+        assert isinstance(session.error, UploadError)
+
+
+@pytest.mark.parametrize("response", ["image_crc32", "image_names_video"])
+def test_auxiliary_image_storage_response_can_never_select_video(response):
+    session = session_without_browser()
+    video_apply(session)
+    image_apply(session)
+    assert session.error is None
+    admit_storage(session, "cover/image")
+    if response == "image_crc32":
+        session.on_response(storage_response("cover/image", data={"crc32": "abcdef12"}))
+    else:
+        session.on_response(storage_response("cover/image", "video-1"))
+    assert session.media_id is None and session.session_key is None and not session.committed
+
+
+@pytest.mark.parametrize("first", ["inline", "commit"])
+def test_conflicting_selected_video_is_latched_before_the_final_barrier(first):
+    session = session_without_browser()
+    session.gate.guard = session._request_guard
+    two_video_apply(session)
+    admit_storage(session, "v/object-2")
+    inline = storage_response("v/object-2", "video-2")
+    commit = native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
+                             request_payload={"SessionKey": "key-1"})
+    chosen, conflicting = (inline, commit) if first == "inline" else (commit, inline)
+    session.on_response(chosen)
+    assert session.committed and session.error is None
+    session.on_response(conflicting)
+    assert isinstance(session.error, UploadError)
+    session.gate.armed = True
+    session.gate.before_send = lambda: pytest.fail("Conflicting video identity must not cross final barrier")
+    route = Route()
+    session.gate.route(route)
+    assert not route.continued and not session.gate.used
 
 
 def test_non_json_browser_429_preserves_cooldown_and_lowercase_retry_header():
@@ -536,6 +803,98 @@ def test_local_chromium_first_mutation_proxy_auth_and_unknown_redirect(monkeypat
         }""", method)
         assert result == "blocked" and isinstance(session.error, UploadError)
         assert received == ["/specific/video", "/specific/video"]
+    finally:
+        if session:
+            session.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.skipif(os.environ.get("TIKTOK_STUDIO_BROWSER_TESTS") != "1", reason="Opt-in local Chromium fixture; no TikTok requests")
+def test_local_chromium_storage_upload_immediately_after_apply_is_registered_first(monkeypatch):
+    """The SDK may POST storage the moment Apply resolves, before Playwright response callbacks run."""
+    received, challenges = [], []
+    proxy_auth = "Basic " + base64.b64encode(b"fixture:fixture").decode("ascii")
+    node = {"Vid": "video-1", "SessionKey": "upload-session-1", "UploadHost": "storage.invalid",
+            "StoreInfos": [{"StoreUri": "tos-fixture/object"}]}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, status=200, body=b"", authenticate=None):
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "http://studio.invalid")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Content-Length", str(len(body)))
+            if authenticate:
+                self.send_header(*authenticate)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_CONNECT(self):
+            self.reply(403)
+
+        def do_GET(self):
+            target = urlparse(self.path)
+            if target.netloc != "studio.invalid":
+                return self.reply(403)
+            if "ApplyUploadInner" in target.query:
+                return self.reply(body=json.dumps({"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}).encode())
+            self.reply()
+
+        def do_POST(self):
+            target = urlparse(self.path)
+            if target.netloc != "storage.invalid":
+                return self.reply(403)
+            if self.headers.get("Proxy-Authorization") != proxy_auth:
+                challenges.append(self.command)
+                return self.reply(407, authenticate=("Proxy-Authenticate", 'Basic realm="storage"'))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.append(target.path + ("?" + target.query if target.query else ""))
+            self.reply()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    account = Account("fixture", cookies=[{"name": "sessionid", "value": "fixture-only", "domain": ".tiktok.com", "path": "/"}],
+                      proxy=f"http://fixture:fixture@127.0.0.1:{server.server_port}")
+    original_origin = studio._studio_origin
+    original_preparation = studio._PublishGate._allowed_preparation
+    monkeypatch.setattr(studio, "_studio_origin", lambda url: url.startswith("http://studio.invalid/") or original_origin(url))
+    def preparation(gate, request):
+        if request.url.startswith("http://storage.invalid/"):
+            request = SimpleNamespace(method=request.method, url=request.url.replace("http://", "https://", 1))
+        return original_preparation(gate, request)
+    monkeypatch.setattr(studio._PublishGate, "_allowed_preparation", preparation)
+    original_on_response = studio._StudioSession.on_response
+    def delayed_on_response(session, response):
+        # Reproduces slow asynchronous response handling around the Playwright round trip.
+        if "ApplyUploadInner" in response.url:
+            session.page.wait_for_timeout(750)
+        original_on_response(session, response)
+    monkeypatch.setattr(studio._StudioSession, "on_response", delayed_on_response)
+    session = None
+    try:
+        session = studio._StudioSession(account, {}, lambda: None, 4)
+        assert session.page.goto("http://studio.invalid/", timeout=4000).status == 200
+        results = session.page.evaluate("""async () => {
+            const apply = await (await fetch('/top/v1?Action=ApplyUploadInner&FileType=video')).json();
+            const n = apply.Result.InnerUploadAddress.UploadNodes[0];
+            const url = 'http://' + n.UploadHost + '/upload/v1/' + n.StoreInfos[0].StoreUri;
+            const query = '?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc';
+            const out = [];
+            for (const target of [url + query, url + '-other' + query]) {
+                try { out.push((await fetch(target, {method: 'POST', body: 'x', credentials: 'include'})).status); }
+                catch { out.push('blocked'); }
+            }
+            return out;
+        }""")
+        assert results == [200, "blocked"]
+        assert received == ["/upload/v1/tos-fixture/object?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc"] and challenges == ["POST"]
+        assert session.error is None and session.gate.blocked_storage_requests == 1
+        assert session.apply_intercepted == 1 and session.video_candidates == {("upload-session-1", "video-1")}
+        assert "tos-fixture" not in session.gate.blocked_shape and "path_known=0" in session.gate.blocked_shape
     finally:
         if session:
             session.close()
