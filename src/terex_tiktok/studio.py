@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from contextlib import ExitStack
 from dataclasses import replace
@@ -123,8 +124,23 @@ class _PublishGate:
         self.request = None
         self.error: Exception | None = None
         self.storage_paths: set[tuple[str, str]] = set()
+        # Upload IDs issued by Apply for each exact storage object.
+        self.storage_uploads: dict[tuple[str, str], set[str]] = {}
         self.blocked_storage_requests = 0
         self.blocked_shape = ""
+
+    @staticmethod
+    def uploads_for(node: dict) -> dict[tuple[str, str], set[str]]:
+        host = node["UploadHost"].lower()
+        uploads: dict[tuple[str, str], set[str]] = {}
+        for item in node["StoreInfos"]:
+            upload_id = item.get("UploadID")
+            if upload_id in (None, ""):
+                continue
+            key = (host, "/" + _upload_string(item["StoreUri"], 2048).lstrip("/"))
+            uploads.setdefault(key, set()).add(_upload_string(upload_id, 512))
+        return uploads
+
     @staticmethod
     def storage_for(node: dict) -> set[tuple[str, str]]:
         host = _upload_string(node["UploadHost"], 253)
@@ -151,7 +167,20 @@ class _PublishGate:
         path = parts.path[len("/upload/v1"):] if parts.path.startswith("/upload/v1/") else parts.path
         method = request.method if request.method in ("GET", "HEAD", "OPTIONS", "POST", "PUT", "DELETE", "PATCH") else "other"
         host = parts.netloc.lower()
-        return (f"method={method} query={int(bool(parts.query))} native_prefix={int(parts.path.startswith('/upload/v1/'))} "
+        params = parse_qs(parts.query, keep_blank_values=True)
+        known = ("uploadid", "device_platform", "phase", "uploadmode", "part_number", "part_offset")
+        names = ",".join(sorted(name for name in params if name in known)) or "none"
+        uid = params.get("uploadid", [""])[0]
+        uid_class = ("none" if not uid else "uuid" if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", uid)
+                     else "hex" if re.fullmatch(r"[0-9a-f]+", uid) else "alnum" if re.fullmatch(r"[0-9A-Za-z_-]+", uid) else "other")
+        match = int(len(params.get("uploadid", ())) == 1
+                    and params["uploadid"][0] in self.storage_uploads.get((host, path), ()))
+        any_match = int(any(uid and uid in ids for ids in self.storage_uploads.values()))
+        issued = int(bool(self.storage_uploads.get((host, path))))
+        return (f"method={method} query={int(bool(parts.query))} qkeys={names} qother={min(len(set(params) - set(known)), 9)} "
+                f"uploadid_match={match} uploadid_any_object={any_match} uploadid_issued={issued} uid_class={uid_class} "
+                f"platform={'web' if params.get('device_platform', [''])[0] == 'web' else 'other'} "
+                f"uid_len={min(len(uid), 999)} native_prefix={int(parts.path.startswith('/upload/v1/'))} "
                 f"segments={min(len([s for s in path.split('/') if s]), 9)} encoded={int('%' in parts.path)} "
                 f"path_known={int((host, path) in self.storage_paths)} known_paths={min(len(self.storage_paths), 999)}")
 
@@ -476,13 +505,15 @@ class _StudioSession:
         if not 1 <= len(nodes) <= MAX_UPLOAD_NODES:
             raise _NativeRejected("node_count_invalid")
         video = file_type == "video"
-        candidates, keys, vids, storage = set(), set(), set(), set()
+        candidates, keys, vids, storage, uploads = set(), set(), set(), set(), {}
         for node in nodes:
             if not isinstance(node, dict):
                 raise _NativeRejected("node_invalid")
             try:
                 storage.update(self.gate.storage_for(node))
-            except (KeyError, TypeError, ValueError):
+                for target, ids in self.gate.uploads_for(node).items():
+                    uploads.setdefault(target, set()).update(ids)
+            except (KeyError, TypeError, ValueError, AttributeError):
                 raise _NativeRejected("storage_invalid") from None
             key, vid = node.get("SessionKey"), node.get("Vid")
             try:
@@ -521,7 +552,8 @@ class _StudioSession:
         self.video_candidates.update(candidates)
         self.aux_keys, self.aux_vids = aux_keys, aux_vids
         self.gate.storage_paths.update(storage)
-
+        for target, ids in uploads.items():
+            self.gate.storage_uploads.setdefault(target, set()).update(ids)
     def _commit(self, request, data, facts: dict):
         try:
             key = request.post_data_json["SessionKey"]

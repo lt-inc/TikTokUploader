@@ -51,10 +51,13 @@ class Route:
     ("https://storage.tiktokcdn.com/upload/v1/bucket/object?delete=1", "POST", False),
     ("https://storage.tiktokcdn.com/upload/v1/bucket/object", "PUT", False),
     ("http://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=up-1&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/other?uploadid=up-1&device_platform=web", "POST", False),
 ])
 def test_native_single_post_is_bound_to_allocated_storage_object(url, method, allowed):
     gate = studio._PublishGate(prepared(), lambda: None)
     gate.storage_paths.add(("storage.tiktokcdn.com", "/bucket/object"))
+    gate.storage_uploads[("storage.tiktokcdn.com", "/bucket/object")] = {"up-1"}
     route = Route(url=url, method=method)
     gate.route(route)
     assert bool(route.continued) is allowed
