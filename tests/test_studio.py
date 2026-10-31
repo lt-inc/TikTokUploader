@@ -141,6 +141,8 @@ def session_without_browser():
     session.gate = studio._PublishGate(session.prepared, session.guard)
     session.error = session.media_id = session.session_key = session.result = None
     session.committed = False
+    session.video_candidates = set()
+    session.other_candidates = set()
     return session
 
 
@@ -155,23 +157,72 @@ def native_response(action, payload=None, *, status=200, headers=None, request_p
                            text=lambda: json.dumps(payload) if payload is not None else "temporarily unavailable")
 
 
-def test_observed_transfer_proof_is_bound_to_native_video_and_storage_path():
+@pytest.mark.parametrize("first_identity", ["video-2", "video-1", "duplicate"])
+def test_observed_transfer_proof_is_bound_to_native_video_and_storage_path(first_identity):
     session = session_without_browser()
     node = {"Vid": "video-1", "SessionKey": "upload-session-1", "UploadHost": "storage.tiktokcdn.com",
             "StoreInfos": [{"StoreUri": "specific/video"}]}
-    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}))
-    assert session.error is None and session.media_id == "video-1" and not session.committed
+    first = node if first_identity == "duplicate" else {**node, "Vid": first_identity, "SessionKey": "upload-session-2"}
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [first, node]}}}))
+    assert session.error is None and session.media_id is None and not session.committed
     allowed = Route(url="https://storage.tiktokcdn.com/specific/video?phase=transfer")
     blocked = Route(url="https://storage.tiktokcdn.com/another/video?phase=transfer")
     session.gate.route(allowed)
     session.gate.route(blocked)
     assert allowed.continued == 1 and blocked.continued == 0
     session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
-                                        request_payload={"SessionKey": "different-upload"}))
-    assert not session.committed
-    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
                                         request_payload={"SessionKey": "upload-session-1"}))
-    assert session.error is None and session.committed
+    assert session.error is None and session.committed and session.media_id == "video-1"
+    assert session.session_key == "upload-session-1" and not session.gate.armed and not session.gate.used
+
+
+@pytest.mark.parametrize("case", ["unknown_key", "unknown_vid", "wrong_pair", "conflicting_results", "malformed_results", "conflicting_commit"])
+def test_commit_requires_one_known_identity_and_never_permits_conflicting_video(case):
+    session = session_without_browser()
+    session.gate.guard = session._request_guard
+    session.video_candidates = {("key-1", "video-1"), ("key-2", "video-2")}
+    key, results = "key-1", [{"Vid": "video-1"}]
+    if case == "unknown_key":
+        key = "unknown"
+    elif case == "unknown_vid":
+        results = [{"Vid": "unknown"}]
+    elif case == "wrong_pair":
+        key = "key-2"
+    elif case == "conflicting_results":
+        results.append({"Vid": "video-2"})
+    elif case == "malformed_results":
+        results.append({})
+    elif case == "conflicting_commit":
+        session.on_response(native_response("CommitUploadInner", {"Result": {"Results": results}},
+                                            request_payload={"SessionKey": key}))
+        assert session.committed and session.error is None
+        key, results = "key-2", [{"Vid": "video-2"}]
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": results}},
+                                        request_payload={"SessionKey": key}))
+    assert isinstance(session.error, UploadError)
+    session.gate.armed = True
+    session.gate.before_send = lambda: pytest.fail("Invalid commit must not cross final barrier")
+    route = Route()
+    session.gate.route(route)
+    assert not route.continued and not session.gate.used
+
+
+@pytest.mark.parametrize("case", ["too_many", "bad_identity", "bad_path", "bad_host"])
+def test_invalid_apply_does_not_partially_grant_storage_permissions(case):
+    session = session_without_browser()
+    node = {"Vid": "video-1", "SessionKey": "key-1", "UploadHost": "storage.tiktokcdn.com",
+            "StoreInfos": [{"StoreUri": "specific/video"}]}
+    invalid = copy.deepcopy(node)
+    if case == "bad_identity":
+        invalid["SessionKey"] = []
+    elif case == "bad_path":
+        invalid["StoreInfos"].append({"StoreUri": "../another/video"})
+    elif case == "bad_host":
+        invalid["UploadHost"] = "storage.invalid\\@www.tiktok.com"
+    nodes = [node] * (studio.MAX_UPLOAD_NODES + 1) if case == "too_many" else [node, invalid]
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": nodes}}}))
+    assert isinstance(session.error, UploadError)
+    assert not session.gate.storage_paths and not session.video_candidates and session.media_id is None
 
 
 def test_non_json_browser_429_preserves_cooldown_and_lowercase_retry_header():
@@ -312,7 +363,9 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
             if self.path.startswith("/passport/"):
                 return self.reply({"message": "success", "data": {"user_id_str": "100", "username": "alice"}})
             if "Action=ApplyUploadInner" in self.path:
-                return self.reply({"Result": {"InnerUploadAddress": {"UploadNodes": [{"Vid": "video-1",
+                return self.reply({"Result": {"InnerUploadAddress": {"UploadNodes": [{"Vid": "video-other",
+                    "SessionKey": "upload-session-other", "UploadHost": "storage.tiktokcdn.com",
+                    "StoreInfos": [{"StoreUri": "other/video"}]}, {"Vid": "video-1",
                     "SessionKey": "upload-session-1", "UploadHost": "storage.tiktokcdn.com",
                     "StoreInfos": [{"StoreUri": "specific/video"}]}]}}})
             return self.reply(HTML)

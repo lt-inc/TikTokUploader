@@ -175,9 +175,10 @@ class Worker:
         deadline = started + 900
         external_started = False
         media_failed = False
+        upload_mode = self.config.upload_mode_for(journal["account_id"])
         context =  (f"publication_id={publication_id} attempt_id={claim['attempt_id']}"
                    f" worker_id={self.worker_id} account_id={journal['account_id']} session_version={journal['session_version']}"
-                   f" upload_mode={self.config.upload_mode}")
+                   f" upload_mode={upload_mode}")
         def guard():
             lease.check()
             if self.stop.is_set() or time.monotonic() >= deadline:
@@ -203,7 +204,7 @@ class Worker:
                               retryable=True, retry_after_seconds=remaining)
                 UPLOADS.labels("rate_limited").inc()
                 return
-            studio = self.config.upload_mode == "studio"
+            studio = upload_mode == "studio"
             proxy_url = proxy_for(row, self.config)
             if not studio:
                 identity = verify_identity(row["cookies"], row["user_agent"], proxy_url)

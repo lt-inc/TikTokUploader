@@ -82,9 +82,25 @@ runtime for the whole upload form. The default remains `http`. Studio's own
 JavaScript transfers the video and constructs the publication request; no paid
 browser service, third-party posting API or TikTok developer app is required.
 
+For an account-scoped pilot, keep `TIKTOK_UPLOAD_MODE=http` and set
+`TIKTOK_STUDIO_ACCOUNT_IDS=23`. Only Terex account ID 23 uses Studio; account 24
+and all other accounts keep HTTP. The optional comma-separated list accepts only
+positive decimal account IDs (no signs, leading zeros, empty entries or values
+above signed int64); invalid values fail startup. Empty/unset preserves the global
+mode, and global `studio` still selects Studio for all accounts. These are Terex
+account IDs, not TikTok remote user IDs. Attempt logs show the selected
+`upload_mode`, and failures never trigger a switch to another protocol.
+
 The worker imports the verified account's cookies, selects the video, fills the
 caption and explicitly selects public/private. It observes the actual upload
 IDs, then validates the native publish payload before allowing one final POST.
+An authenticated Apply response may return up to 16 upload nodes. The worker
+validates all candidates before permitting transfers only to their exact returned
+storage hosts/paths. It selects the video only when the actual Commit request's
+SessionKey and the complete Results Vid set identify one known video. Duplicate
+candidates/results for that identity are consistent; unknown identities, multiple
+committed identities or conflicting later commits stop the attempt. Multiple
+upload candidates never permit more than one video in the final publish payload.
 The durable Terex checkpoint runs in the browser request gate immediately before
 that send. Browser retries cannot issue a second final POST. The browser-generated
 creation ID replaces the HTTP worker's local project ID before the checkpoint.

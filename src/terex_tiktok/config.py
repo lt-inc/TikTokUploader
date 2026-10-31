@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def parse_studio_account_ids(value: str | None) -> tuple[int, ...]:
+    if value is None or not value.strip():
+        return ()
+    parts = [part.strip() for part in value.split(",")]
+    if any(not re.fullmatch(r"[1-9][0-9]{0,18}", part) or int(part) > 2**63 - 1 for part in parts):
+        raise ValueError("TIKTOK_STUDIO_ACCOUNT_IDS must contain comma-separated positive account IDs")
+    return tuple(sorted({int(part) for part in parts}))
 
 
 def parse_media_origin(value: str | None) -> str | None:
@@ -47,6 +57,10 @@ class Config:
     media_hosts: tuple[str, ...] = ()
     upload_mode: str = "http"
     media_download_origin: str | None = None
+    studio_account_ids: tuple[int, ...] = ()
+
+    def upload_mode_for(self, account_id: int) -> str:
+        return "studio" if account_id in self.studio_account_ids else self.upload_mode
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -83,4 +97,5 @@ class Config:
             tuple(x.strip() for x in os.environ.get("TIKTOK_MEDIA_HOSTS", "").split(",") if x.strip()),
             upload_mode,
             parse_media_origin(os.environ.get("TIKTOK_MEDIA_DOWNLOAD_ORIGIN")),
+            parse_studio_account_ids(os.environ.get("TIKTOK_STUDIO_ACCOUNT_IDS")),
         )

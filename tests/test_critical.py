@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import base64
 import json
 import threading
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from autotok.uploader import Client
 from autotok.accounts import Account
-from terex_tiktok.config import Config
+from terex_tiktok.config import Config, parse_studio_account_ids
 from terex_tiktok.connections import Connections
 from terex_tiktok.identity import Identity, SessionRejected, checked_cookies
 from terex_tiktok.main_client import Fenced, Lease
@@ -148,10 +149,14 @@ def test_media_id_is_not_post_id_and_ambiguous_match_is_not_success():
                          {**journal, "post_ids": [], "creation_id": "exact-creation"})["remote_id"] == "999"
 
 
-@pytest.mark.parametrize("upload_mode", ["http", "studio"])
-def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monkeypatch, upload_mode):
+@pytest.mark.parametrize("upload_mode,global_mode,account_ids", [
+    ("http", "http", ()), ("studio", "studio", ()),
+    ("studio", "http", (18,)), ("http", "http", (23,)),
+])
+def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monkeypatch, caplog, upload_mode, global_mode, account_ids):
     """Go int64 IDs/complete state and Python verify DTO cross the HTTP boundary."""
-    cfg = replace(config(tmp_path), upload_mode=upload_mode)
+    cfg = replace(config(tmp_path), upload_mode=global_mode, studio_account_ids=account_ids)
+    caplog.set_level("INFO", logger="tiktok.worker")
     cfg.scratch_dir.mkdir()
     store = EncryptedStore(cfg.state_dir, cfg.encryption_key)
     connections = Connections(store, cfg)
@@ -232,6 +237,7 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
             return proof
     monkeypatch.setattr("terex_tiktok.worker.inspect_posts", inspect)
     worker.execute({"publication_id": 12, "attempt_id": "attempt-1", "expected_version": 2})
+    assert f"upload_mode={upload_mode}" in caplog.text
     assert seen == ["claim", "checkpoint", "checkpoint", "checkpoint", "checkpoint", "checkpoint", "complete", "release"]
     journal = store.get("publication", 12)
     assert type(journal["publication_id"]) is int and type(journal["account_id"]) is int
@@ -249,6 +255,22 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
             json={"publication_id": 12, "account_id": 18, "remote_account_id": "100", "remote_id": "999"})
         assert response.status_code == 200 and response.json()["verified"] is True
     worker.main.client.close()
+
+
+def test_studio_account_opt_in_is_strict_and_loaded_from_environment(monkeypatch):
+    env = {"TIKTOK_SESSION_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"k" * 32).decode(),
+           "TIKTOK_MAIN_BE_URL": "http://main", "APP_PUBLIC_URL": "https://admin.example",
+           "TIKTOK_UPLOADER_API_TOKEN": "fixture", "TIKTOK_WORKER_TOKEN": "fixture", "RABBITMQ_URL": "amqp://localhost",
+           "TIKTOK_UPLOAD_MODE": "http", "TIKTOK_STUDIO_ACCOUNT_IDS": "23", "TIKTOK_MEDIA_DOWNLOAD_ORIGIN": ""}
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    cfg = Config.from_env()
+    assert cfg.studio_account_ids == (23,)
+    assert cfg.upload_mode_for(23) == "studio" and cfg.upload_mode_for(24) == "http"
+    assert parse_studio_account_ids(None) == parse_studio_account_ids("") == ()
+    for invalid in ("0", "-23", "+23", "23.0", "023", "23,", "23,,24", "True", "２３", "9223372036854775808"):
+        with pytest.raises(ValueError, match="TIKTOK_STUDIO_ACCOUNT_IDS"):
+            parse_studio_account_ids(invalid)
 
 
 def test_publish_browser_wait_preserves_operation_and_stays_fenced():
