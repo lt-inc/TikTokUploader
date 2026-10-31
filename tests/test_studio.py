@@ -197,6 +197,7 @@ def session_without_browser():
     session.committed = False
     session.video_candidates = set()
     session.aux_keys, session.aux_vids = set(), set()
+    session.video_storage = {}
     return session
 
 
@@ -339,6 +340,156 @@ def test_invalid_apply_does_not_partially_grant_storage_permissions(case):
     session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": nodes}}}))
     assert isinstance(session.error, UploadError)
     assert not session.gate.storage_paths and not session.video_candidates and session.media_id is None
+
+
+STORAGE_HOST = "storage.tiktokcdn.com"
+UPLOAD_UUID = "12345678-1234-4234-8234-123456789abc"
+
+
+def two_video_apply(session):
+    nodes = [{"Vid": f"video-{n}", "SessionKey": f"key-{n}", "UploadHost": STORAGE_HOST,
+              "StoreInfos": [{"StoreUri": f"v/object-{n}"}]} for n in (1, 2)]
+    session.on_response(native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": nodes}}}))
+    assert session.error is None
+
+
+def admit_storage(session, path, host=STORAGE_HOST):
+    route = Route(url=f"https://{host}/upload/v1/{path}?uploadid={UPLOAD_UUID}&device_platform=web")
+    session.gate.route(route)
+    return route
+
+
+def storage_response(path, vid="video-2", *, host=STORAGE_HOST, status=200, code=2000, request_id="r" * 34,
+                     meta=None, results=None, data=None):
+    video_meta = {"Uri": "m" * 56, "Height": 1280, "Width": 720, "OriginHeight": 1280, "OriginWidth": 720,
+                  "Duration": 5, "Bitrate": 1000, "Format": "mp4", "Size": 12345, "FileType": "video", "Codec": "h264"}
+    video_meta.update(meta or {})
+    body = data if data is not None else {
+        "file_info": {"crc32": "abcdef12"},
+        "post_upload_resp": {"request_id": request_id, "multi_callback_args": [""], "plugin_results": [None],
+                             "results": [{"vid": vid, "video_meta": video_meta}] if results is None else results}}
+    payload = {"apiversion": "1", "code": code, "data": body, "message": "Success"}
+    url = f"https://{host}/upload/v1/{path}?uploadid={UPLOAD_UUID}&device_platform=web"
+    return SimpleNamespace(url=url, request=SimpleNamespace(url=url, method="POST", post_data_json=None), status=status,
+                           headers={}, json=lambda: payload, text=lambda: json.dumps(payload))
+
+
+def test_apply_records_video_storage_identities_and_never_auxiliary_images():
+    session = session_without_browser()
+    two_video_apply(session)
+    image_apply(session)
+    assert session.video_storage == {(STORAGE_HOST, "/v/object-1"): {("key-1", "video-1")},
+                                     (STORAGE_HOST, "/v/object-2"): {("key-2", "video-2")}}
+
+
+@pytest.mark.parametrize("order", ["video_first", "image_first"])
+def test_auxiliary_image_storage_may_not_overlap_video_storage(order):
+    session = session_without_browser()
+    if order == "video_first":
+        video_apply(session)
+    node = {"Vid": "", "SessionKey": "image-key", "UploadHost": STORAGE_HOST, "StoreInfos": [{"StoreUri": "v/video"}]}
+    image = native_response("ApplyUploadInner", {"Result": {"InnerUploadAddress": {"UploadNodes": [node]}}}, file_type="image")
+    if order == "video_first":
+        session.on_response(image)
+    else:
+        session.on_response(image)
+        assert session.error is None
+        video_apply(session)
+    assert isinstance(session.error, UploadError)
+    assert ("image-key", "") not in session.video_storage.get((STORAGE_HOST, "/v/video"), set())
+
+
+def test_observed_inline_video_proof_selects_the_exact_candidate_for_its_object():
+    session = session_without_browser()
+    two_video_apply(session)
+    assert admit_storage(session, "v/object-2").continued == 1
+    session.on_response(storage_response("v/object-2", "video-2"))
+    assert session.error is None and session.committed
+    assert session.media_id == "video-2" and session.session_key == "key-2"
+    session.on_response(native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-2"}]}},
+                                        request_payload={"SessionKey": "key-2"}))
+    assert session.error is None and session.media_id == "video-2"
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_vid", "other_object_vid", "unknown_host", "unknown_path", "not_admitted", "wrong_code", "http_500",
+    "bare_crc32", "missing_request_id", "two_results", "no_results", "empty_meta", "image_filetype",
+    "zero_duration", "bool_size", "string_width"])
+def test_inline_storage_response_without_complete_exact_proof_cannot_select_video(case):
+    session = session_without_browser()
+    two_video_apply(session)
+    path, host, kwargs = "v/object-2", STORAGE_HOST, {}
+    if case == "wrong_vid":
+        kwargs["vid"] = "unknown-vid"
+    elif case == "other_object_vid":
+        kwargs["vid"] = "video-1"
+    elif case == "unknown_host":
+        host = "other.tiktokcdn.com"
+    elif case == "unknown_path":
+        path = "v/object-3"
+    elif case == "wrong_code":
+        kwargs["code"] = 2001
+    elif case == "http_500":
+        kwargs["status"] = 500
+    elif case == "bare_crc32":
+        kwargs["data"] = {"crc32": "abcdef12"}
+    elif case == "missing_request_id":
+        kwargs["request_id"] = ""
+    elif case == "two_results":
+        kwargs["results"] = [{"vid": "video-2", "video_meta": {"Duration": 1}}] * 2
+    elif case == "no_results":
+        kwargs["results"] = []
+    elif case == "empty_meta":
+        kwargs["results"] = [{"vid": "video-2", "video_meta": {}}]
+    elif case == "image_filetype":
+        kwargs["meta"] = {"FileType": "image"}
+    elif case == "zero_duration":
+        kwargs["meta"] = {"Duration": 0}
+    elif case == "bool_size":
+        kwargs["meta"] = {"Size": True}
+    elif case == "string_width":
+        kwargs["meta"] = {"Width": "720"}
+    if case not in ("not_admitted", "unknown_host", "unknown_path"):
+        admit_storage(session, path)
+    session.on_response(storage_response(path, host=host, **kwargs))
+    assert session.media_id is None and session.session_key is None and not session.committed
+    if case not in ("not_admitted", "unknown_host", "unknown_path", "bare_crc32"):
+        assert isinstance(session.error, UploadError)
+
+
+@pytest.mark.parametrize("response", ["image_crc32", "image_names_video"])
+def test_auxiliary_image_storage_response_can_never_select_video(response):
+    session = session_without_browser()
+    video_apply(session)
+    image_apply(session)
+    assert session.error is None
+    admit_storage(session, "cover/image")
+    if response == "image_crc32":
+        session.on_response(storage_response("cover/image", data={"crc32": "abcdef12"}))
+    else:
+        session.on_response(storage_response("cover/image", "video-1"))
+    assert session.media_id is None and session.session_key is None and not session.committed
+
+
+@pytest.mark.parametrize("first", ["inline", "commit"])
+def test_conflicting_selected_video_is_latched_before_the_final_barrier(first):
+    session = session_without_browser()
+    session.gate.guard = session._request_guard
+    two_video_apply(session)
+    admit_storage(session, "v/object-2")
+    inline = storage_response("v/object-2", "video-2")
+    commit = native_response("CommitUploadInner", {"Result": {"Results": [{"Vid": "video-1"}]}},
+                             request_payload={"SessionKey": "key-1"})
+    chosen, conflicting = (inline, commit) if first == "inline" else (commit, inline)
+    session.on_response(chosen)
+    assert session.committed and session.error is None
+    session.on_response(conflicting)
+    assert isinstance(session.error, UploadError)
+    session.gate.armed = True
+    session.gate.before_send = lambda: pytest.fail("Conflicting video identity must not cross final barrier")
+    route = Route()
+    session.gate.route(route)
+    assert not route.continued and not session.gate.used
 
 
 def test_non_json_browser_429_preserves_cooldown_and_lowercase_retry_header():
