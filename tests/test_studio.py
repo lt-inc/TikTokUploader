@@ -53,6 +53,15 @@ class Route:
     ("http://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
     ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=up-1&device_platform=web", "POST", False),
     ("https://storage.tiktokcdn.com/upload/v1/bucket/other?uploadid=up-1&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "POST", True),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789ABC&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=&device_platform=web", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=other", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web&", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web#x", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "PUT", False),
+    ("http://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web", "POST", False),
 ])
 def test_native_single_post_is_bound_to_allocated_storage_object(url, method, allowed):
     gate = studio._PublishGate(prepared(), lambda: None)
@@ -62,6 +71,31 @@ def test_native_single_post_is_bound_to_allocated_storage_object(url, method, al
     gate.route(route)
     assert bool(route.continued) is allowed
     assert not gate.used and gate.error is None
+
+
+def test_native_storage_id_is_pinned_only_on_admission_and_request_count_is_bounded(monkeypatch):
+    monkeypatch.setattr(studio, "MAX_NATIVE_STORAGE_REQUESTS", 2)
+    gate = studio._PublishGate(prepared(), lambda: None)
+    key = ("storage.tiktokcdn.com", "/bucket/object")
+    gate.storage_paths.add(key)
+    url = "https://storage.tiktokcdn.com/upload/v1/bucket/object?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc"
+    first = Route(url=url)
+    for _ in range(3):
+        assert gate._allowed_preparation(first.request)
+    assert not gate.native_storage_requests and not gate.native_upload_ids
+    gate.route(first)
+    assert first.continued == 1 and gate.native_storage_requests[key] == 1
+    changed = Route(url=url.replace("123456789abc", "123456789abd"))
+    gate.route(changed)
+    assert changed.aborted == 1 and gate.native_storage_requests[key] == 1
+    second = Route(url=url)
+    gate.route(second)
+    assert second.continued == 1 and gate.native_storage_requests[key] == 2
+    capped = Route(url=url)
+    gate.route(capped)
+    assert capped.aborted == 1 and not capped.continued
+    assert isinstance(gate.error, UploadError) and gate.error.diagnostics["native"] == "reason=cap_exceeded"
+    assert not gate.armed and not gate.used
 
 
 def test_unarmed_publish_and_following_valid_request_never_reach_network():
@@ -697,15 +731,16 @@ def test_local_chromium_storage_upload_immediately_after_apply_is_registered_fir
             const apply = await (await fetch('/top/v1?Action=ApplyUploadInner&FileType=video')).json();
             const n = apply.Result.InnerUploadAddress.UploadNodes[0];
             const url = 'http://' + n.UploadHost + '/upload/v1/' + n.StoreInfos[0].StoreUri;
+            const query = '?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc';
             const out = [];
-            for (const target of [url, url + '-other']) {
+            for (const target of [url + query, url + '-other' + query]) {
                 try { out.push((await fetch(target, {method: 'POST', body: 'x', credentials: 'include'})).status); }
                 catch { out.push('blocked'); }
             }
             return out;
         }""")
         assert results == [200, "blocked"]
-        assert received == ["/upload/v1/tos-fixture/object"] and challenges == ["POST"]
+        assert received == ["/upload/v1/tos-fixture/object?device_platform=web&uploadid=12345678-1234-4234-8234-123456789abc"] and challenges == ["POST"]
         assert session.error is None and session.gate.blocked_storage_requests == 1
         assert session.apply_intercepted == 1 and session.video_candidates == {("upload-session-1", "video-1")}
         assert "tos-fixture" not in session.gate.blocked_shape and "path_known=0" in session.gate.blocked_shape

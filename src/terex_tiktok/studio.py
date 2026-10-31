@@ -35,6 +35,7 @@ PROJECT_PREPARATION_PATHS = {
 MAX_UPLOAD_NODES = 16
 MAX_STORE_INFOS = 16
 MAX_APPLY_BODY = 1 << 20
+MAX_NATIVE_STORAGE_REQUESTS = 1024
 _NATIVE_FACTS = ("action", "file_type", "reason", "nodes", "empty_vid", "empty_key", "invalid_store", "results")
 
 
@@ -126,6 +127,8 @@ class _PublishGate:
         self.storage_paths: set[tuple[str, str]] = set()
         # Upload IDs issued by Apply for each exact storage object.
         self.storage_uploads: dict[tuple[str, str], set[str]] = {}
+        self.native_upload_ids: dict[tuple[str, str], str] = {}
+        self.native_storage_requests: dict[tuple[str, str], int] = {}
         self.blocked_storage_requests = 0
         self.blocked_shape = ""
 
@@ -177,8 +180,11 @@ class _PublishGate:
                     and params["uploadid"][0] in self.storage_uploads.get((host, path), ()))
         any_match = int(any(uid and uid in ids for ids in self.storage_uploads.values()))
         issued = int(bool(self.storage_uploads.get((host, path))))
+        pinned = self.native_upload_ids.get((host, path))
+        count = self.native_storage_requests.get((host, path), 0)
         return (f"method={method} query={int(bool(parts.query))} qkeys={names} qother={min(len(set(params) - set(known)), 9)} "
                 f"uploadid_match={match} uploadid_any_object={any_match} uploadid_issued={issued} uid_class={uid_class} "
+                f"pinned_mismatch={int(pinned is not None and uid != pinned)} native_count={min(count, MAX_NATIVE_STORAGE_REQUESTS)} cap_exceeded={int(count >= MAX_NATIVE_STORAGE_REQUESTS)} "
                 f"platform={'web' if params.get('device_platform', [''])[0] == 'web' else 'other'} "
                 f"uid_len={min(len(uid), 999)} native_prefix={int(parts.path.startswith('/upload/v1/'))} "
                 f"segments={min(len([s for s in path.split('/') if s]), 9)} encoded={int('%' in parts.path)} "
@@ -196,11 +202,23 @@ class _PublishGate:
                 return True
             if parts.path.rstrip("/") == "/top/v1" and query.get("Action", [None])[0] in ("ApplyUploadInner", "CommitUploadInner"):
                 return True
-        # Current native SDK uses a single POST with no query. The exact
-        # object and host still come only from its authenticated Apply response.
-        if (request.method == "POST" and not parts.query and parts.path.startswith("/upload/v1/")
-                and (parts.netloc.lower(), parts.path[len("/upload/v1"):]) in self.storage_paths):
-            return True
+        # The measured SDK also sends its own UUID, different from Apply's
+        # UploadID. It is a transport identifier, never authority for a new
+        # object. Pin it to the exact authenticated allocation on first send.
+        if request.method == "POST" and parts.path.startswith("/upload/v1/"):
+            key = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+            if parts.fragment:
+                return False
+            if key in self.storage_paths and self.native_storage_requests.get(key, 0) < MAX_NATIVE_STORAGE_REQUESTS:
+                if not parts.query:
+                    return True
+                params = parse_qs(parts.query, keep_blank_values=True)
+                if (len(parts.query.split("&")) == 2 and "%" not in parts.query
+                        and set(params) == {"uploadid", "device_platform"} and all(len(v) == 1 for v in params.values())):
+                    uid = params["uploadid"][0]
+                    return (params["device_platform"] == ["web"]
+                            and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", uid) is not None
+                            and self.native_upload_ids.get(key, uid) == uid)
         return (request.method in ("POST", "PUT") and (parts.netloc.lower(), parts.path) in self.storage_paths
                 and query.get("phase", [None])[0] in ("transfer", "finish"))
 
@@ -213,11 +231,24 @@ class _PublishGate:
             path = _publish_path(request)
             if path is None:
                 if self._allowed_preparation(request):
+                    parts = urlparse(request.url)
+                    if request.method == "POST" and parts.path.startswith("/upload/v1/"):
+                        key = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+                        self.native_storage_requests[key] = self.native_storage_requests.get(key, 0) + 1
+                        uid = parse_qs(parts.query).get("uploadid", [None])[0]
+                        if uid is not None:
+                            self.native_upload_ids.setdefault(key, uid)
                     route.continue_()
                 else:
                     if urlparse(request.url).netloc.lower() in {host for host, _ in self.storage_paths}:
                         self.blocked_storage_requests = min(1000, self.blocked_storage_requests + 1)
-                        self.blocked_shape = self._storage_shape(request)
+                        self.blocked_shape = self.blocked_shape or self._storage_shape(request)
+                        parts = urlparse(request.url)
+                        key = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+                        if (parts.path.startswith("/upload/v1/") and key in self.storage_paths
+                                and self.native_storage_requests.get(key, 0) >= MAX_NATIVE_STORAGE_REQUESTS):
+                            self.error = UploadError("Native storage request limit reached", stage="studio storage",
+                                                     diagnostics={"native": "reason=cap_exceeded"})
                     # Unknown mutations, including a changed publication API,
                     # never leave the browser. Dropped telemetry is harmless.
                     route.abort("blockedbyclient")
