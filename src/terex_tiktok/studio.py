@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from contextlib import ExitStack
+from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -169,10 +170,17 @@ class _StudioSession:
         self.committed = False
         self.result = None
         self.closed = False
+        self.proxy = account.get_proxy()
+        self.auth_attempts: set[str] = set()
         try:
             self.stack.enter_context(browser_permit(guard=wait_guard, label=label))
             pw = self.stack.enter_context(sync_playwright())
-            browser = launch_chromium(pw, headless=True, proxy=account.get_proxy())
+            # Only our scoped auth handler may supply credentials. Playwright
+            # otherwise reuses proxy credentials for unrelated server challenges.
+            browser_proxy = self.proxy
+            if self.proxy and self.proxy.scheme in ("http", "https"):
+                browser_proxy = replace(self.proxy, username=None, password=None)
+            browser = launch_chromium(pw, headless=True, proxy=browser_proxy)
             self.stack.callback(browser.close)
             self.context = browser.new_context(user_agent=account.user_agent, locale="en-US", service_workers="block")
             self.stack.callback(self.context.close)
@@ -184,10 +192,15 @@ class _StudioSession:
             # Playwright routes only the first request in a redirect chain.
             # Intercept native responses as well so a 307/308 cannot bypass the
             # request gate or resend an already submitted publication.
+            # Arm response interception per mutation and handle proxy challenges
+            # in this Fetch session as well; a second Fetch client cannot rely
+            # on Playwright's internal auth handler.
             self.cdp = self.context.new_cdp_session(self.page)
             self.stack.callback(self.cdp.detach)
             self.cdp.on("Fetch.requestPaused", self.on_response_paused)
-            self.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Response"}]})
+            self.cdp.on("Fetch.authRequired", self.on_auth_required)
+            self.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}],
+                                           "handleAuthRequests": True})
         except BaseException:
             self.close()
             raise
@@ -230,12 +243,45 @@ class _StudioSession:
         if request == self.gate.request and self.error is None:
             self.error = PublishUncertainError("The Studio publish response was lost; inspect the account")
 
+    def on_auth_required(self, event):
+        response = {"response": "CancelAuth"}
+        try:
+            self._request_guard()
+            challenge = event["authChallenge"]
+            origin = urlparse(challenge["origin"])
+            proxy = self.proxy
+            if (proxy and proxy.username is not None and challenge.get("source") == "Proxy"
+                    and origin.scheme in ("http", "https") and origin.scheme == proxy.scheme
+                    and origin.hostname is not None
+                    and origin.hostname.encode("idna").lower() == proxy.host.encode("idna").lower()
+                    and (origin.port if origin.port is not None else (443 if origin.scheme == "https" else 80)) == proxy.port
+                    and origin.username is None and origin.password is None
+                    and origin.path in ("", "/") and not origin.query and not origin.fragment
+                    and event["requestId"] not in self.auth_attempts):
+                # Keep IDs until close: clearing on a 407/redirect would permit
+                # an unbounded authentication loop on the same request.
+                self.auth_attempts.add(event["requestId"])
+                response = {"response": "ProvideCredentials", "username": proxy.username, "password": proxy.password or ""}
+            self.cdp.send("Fetch.continueWithAuth", {"requestId": event["requestId"], "authChallengeResponse": response})
+            return
+        except Exception:
+            if self.error is None:
+                self.error = (PublishUncertainError("Studio proxy authentication failed after publication") if self.gate.used
+                              else UploadError("Studio proxy authentication failed", stage="studio proxy auth"))
+        try:
+            self.cdp.send("Fetch.continueWithAuth", {"requestId": event["requestId"],
+                                                    "authChallengeResponse": {"response": "CancelAuth"}})
+        except Exception:
+            pass
+
     def on_response_paused(self, event):
         request = event["request"]
-        redirect = (request["method"] not in ("GET", "HEAD", "OPTIONS")
-                    and 300 <= event.get("responseStatusCode", 0) < 400)
+        mutation = request["method"] not in ("GET", "HEAD", "OPTIONS")
+        response_stage = "responseStatusCode" in event or "responseErrorReason" in event
         try:
-            if redirect:
+            if not response_stage:
+                self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"], "interceptResponse": mutation})
+            elif mutation and 300 <= event.get("responseStatusCode", 0) < 400:
                 if self.error is None:
                     self.error = (PublishUncertainError("A redirect after Studio publication was blocked; inspect the account")
                                   if self.gate.used else UploadError("A Studio mutation redirect was blocked", stage="studio redirect"))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
@@ -13,6 +14,7 @@ import pytest
 
 from autotok.accounts import Account
 from autotok.errors import PublishUncertainError, UploadError
+from autotok.proxy import Proxy
 from terex_tiktok import studio
 from terex_tiktok.main_client import Fenced
 from terex_tiktok.identity import SessionRejected
@@ -193,6 +195,44 @@ def test_lost_final_response_is_uncertain_and_never_arms_a_second_send():
     assert second.continued == 0
 
 
+@pytest.mark.parametrize("case", ["match", "server", "host", "port", "scheme", "malformed", "repeat", "fenced", "send_failure"])
+def test_proxy_auth_is_scoped_single_attempt_and_fails_closed(case):
+    session = session_without_browser()
+    session.proxy = Proxy.parse("http://fixture:fixture@proxy.invalid:80")
+    session.auth_attempts = {"request-1"} if case == "repeat" else set()
+    challenge = {"source": "Proxy", "origin": "http://PROXY.invalid"}
+    if case == "server":
+        challenge["source"] = "Server"
+    elif case in ("host", "port", "scheme", "malformed"):
+        challenge["origin"] = {"host": "http://other.invalid", "port": "http://proxy.invalid:81",
+                               "scheme": "https://proxy.invalid:80", "malformed": "http://proxy.invalid:bad"}[case]
+    elif case == "fenced":
+        def guard():
+            raise Fenced("fixture fence")
+        session.guard = guard
+    calls = []
+    def send(method, payload):
+        calls.append((method, payload["authChallengeResponse"]))
+        if case == "send_failure" and len(calls) == 1:
+            raise RuntimeError("fixture protocol failure")
+    session.cdp = SimpleNamespace(send=send)
+    session.gate.used = case == "send_failure"
+    session.on_auth_required({"requestId": "request-1", "authChallenge": challenge})
+    assert all(method == "Fetch.continueWithAuth" for method, _ in calls)
+    if case in ("match", "send_failure"):
+        assert calls[0][1] == {"response": "ProvideCredentials", "username": "fixture", "password": "fixture"}
+        assert "request-1" in session.auth_attempts
+    else:
+        assert calls == [("Fetch.continueWithAuth", {"response": "CancelAuth"})]
+    if case == "send_failure":
+        assert calls[-1][1] == {"response": "CancelAuth"}
+        assert isinstance(session.error, PublishUncertainError)
+    elif case in ("fenced", "malformed"):
+        assert isinstance(session.error, UploadError)
+    else:
+        assert session.error is None
+
+
 HTML = """<!doctype html><html><body>
 <div id="inputs"></div><div contenteditable="true"></div>
 <div data-e2e="video_visibility_container"><button role="combobox" onclick="document.querySelector('#options').hidden=false">Everyone</button></div>
@@ -228,9 +268,12 @@ async function publish() {
 
 @pytest.mark.skipif(os.environ.get("TIKTOK_STUDIO_BROWSER_TESTS") != "1", reason="Opt-in local Chromium fixture; no TikTok requests")
 @pytest.mark.parametrize("scenario", ["success", "wrong_identity", "checkpoint_rejected", "preparation_redirect", "publish_redirect"])
-def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch, scenario):
+@pytest.mark.parametrize("use_proxy", [False, True])
+def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch, scenario, use_proxy):
     """Real Phantomwright routing/locators against a loopback-only fake Studio."""
     received = []
+    challenges = []
+    proxy_auth = "Basic " + base64.b64encode(b"fixture:fixture").decode("ascii")
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -245,7 +288,27 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
             self.end_headers()
             self.wfile.write(encoded)
 
+        def authenticate(self):
+            if not use_proxy:
+                return True
+            target = urlparse(self.path)
+            # This proxy never forwards traffic or warms auth on background requests.
+            if target.netloc != "studio.invalid":
+                self.reply({}, 403)
+                return False
+            if self.headers.get("Proxy-Authorization") != proxy_auth:
+                challenges.append(self.command)
+                self.send_response(407)
+                self.send_header("Proxy-Authenticate", 'Basic realm="fixture"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return False
+            self.path = target.path + ("?" + target.query if target.query else "")
+            return True
+
         def do_GET(self):
+            if not self.authenticate():
+                return
             if self.path.startswith("/passport/"):
                 return self.reply({"message": "success", "data": {"user_id_str": "100", "username": "alice"}})
             if "Action=ApplyUploadInner" in self.path:
@@ -255,6 +318,8 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
             return self.reply(HTML)
 
         def do_POST(self):
+            if not self.authenticate():
+                return
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             received.append((self.path, json.loads(body or b"{}")))
             if "Action=CommitUploadInner" in self.path:
@@ -270,7 +335,7 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    origin = f"http://127.0.0.1:{server.server_port}"
+    origin = "http://studio.invalid" if use_proxy else f"http://127.0.0.1:{server.server_port}"
     original_origin = studio._studio_origin
     original_preparation = studio._PublishGate._allowed_preparation
     # Only the fixture origin is substituted. Production checks remain HTTPS
@@ -283,7 +348,8 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
         return original_preparation(gate, request)
     monkeypatch.setattr(studio._PublishGate, "_allowed_preparation", preparation)
     account = Account("fixture", cookies=[{"name": "sessionid", "value": "fixture-only", "domain": ".tiktok.com", "path": "/"}],
-                      user_agent="Mozilla/5.0 Chrome/140.0.0.0")
+                      user_agent="Mozilla/5.0 Chrome/140.0.0.0",
+                      proxy=f"http://fixture:fixture@127.0.0.1:{server.server_port}" if use_proxy else None)
     video = tmp_path / "video.mp4"
     video.write_bytes(b"synthetic video input")
     deadline = time.monotonic() + 15
@@ -298,9 +364,11 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
         if scenario == "wrong_identity":
             with pytest.raises(SessionRejected, match="authorized TikTok account"):
                 client.prepare(video, "A specific caption #test", visibility="private")
+            assert challenges == (["GET"] if use_proxy else [])
             assert not received
             return
         state = client.prepare(video, "A specific caption #test", visibility="private")
+        assert challenges == (["GET"] if use_proxy else [])
         if scenario == "preparation_redirect":
             with pytest.raises(UploadError, match="redirect"):
                 client.transfer(state)
@@ -328,6 +396,96 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
     finally:
         if state:
             state["session"].close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.skipif(os.environ.get("TIKTOK_STUDIO_BROWSER_TESTS") != "1", reason="Opt-in local Chromium fixture; no TikTok requests")
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_local_chromium_first_mutation_proxy_auth_and_unknown_redirect(monkeypatch, method):
+    """A new upload origin challenges the first mutation, with no auth warmup."""
+    challenges, received, server_authorizations = [], [], []
+    proxy_auth = "Basic " + base64.b64encode(b"fixture:fixture").decode("ascii")
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, status=200, *, authenticate=None, location=None):
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "http://studio.invalid")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Allow-Methods", "POST, PUT, OPTIONS")
+            self.send_header("Content-Length", "0")
+            if authenticate:
+                self.send_header(*authenticate)
+            if location:
+                self.send_header("Location", location)
+            self.end_headers()
+
+        def do_CONNECT(self):
+            self.reply(403)  # Never forward a connection outside this fixture.
+
+        def do_GET(self):
+            target = urlparse(self.path)
+            if target.netloc != "studio.invalid":
+                return self.reply(403)
+            if target.path == "/server-auth":
+                server_authorizations.append(self.headers.get("Authorization") is not None)
+                return self.reply(401, authenticate=("WWW-Authenticate", 'Basic realm="server"'))
+            self.reply()
+
+        def do_OPTIONS(self):
+            self.reply(204)
+
+        def do_POST(self):
+            target = urlparse(self.path)
+            if target.netloc != "storage.invalid":
+                return self.reply(403)
+            if self.headers.get("Proxy-Authorization") != proxy_auth:
+                challenges.append(self.command)
+                return self.reply(407, authenticate=("Proxy-Authenticate", 'Basic realm="storage"'))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.append(target.path)
+            if "phase=finish" in target.query:
+                return self.reply(307, location="http://storage.invalid/unknown-redirect-target")
+            self.reply()
+
+        do_PUT = do_POST
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    account = Account("fixture", cookies=[{"name": "sessionid", "value": "fixture-only", "domain": ".tiktok.com", "path": "/"}],
+                      proxy=f"http://fixture:fixture@127.0.0.1:{server.server_port}")
+    original_preparation = studio._PublishGate._allowed_preparation
+    def preparation(gate, request):
+        if request.url.startswith("http://storage.invalid/"):
+            request = SimpleNamespace(method=request.method, url=request.url.replace("http://", "https://", 1))
+        return original_preparation(gate, request)
+    monkeypatch.setattr(studio._PublishGate, "_allowed_preparation", preparation)
+    session = None
+    try:
+        session = studio._StudioSession(account, {}, lambda: None, 4)
+        session.gate.storage_paths.add(("storage.invalid", "/specific/video"))
+        assert session.page.goto("http://studio.invalid/", timeout=4000).status == 200
+        assert not challenges
+        status = session.page.evaluate("""async method => (await fetch(
+            'http://storage.invalid/specific/video?phase=transfer',
+            {method, body:'fixture', credentials:'include'})).status""", method)
+        assert status == 200 and challenges == [method] and received == ["/specific/video"]
+        assert session.page.evaluate("async () => (await fetch('/server-auth')).status") == 401
+        assert server_authorizations == [False] and session.error is None
+        result = session.page.evaluate("""async method => {
+            try { await fetch('http://storage.invalid/specific/video?phase=finish',
+                {method, body:'fixture', credentials:'include'}); return 'followed'; }
+            catch { return 'blocked'; }
+        }""", method)
+        assert result == "blocked" and isinstance(session.error, UploadError)
+        assert received == ["/specific/video", "/specific/video"]
+    finally:
+        if session:
+            session.close()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
