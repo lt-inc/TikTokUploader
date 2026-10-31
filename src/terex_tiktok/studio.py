@@ -492,8 +492,11 @@ class _StudioSession:
         candidates = self.video_storage.get(target)
         if not candidates or self.gate.native_storage_requests.get(target, 0) == 0:
             return False
+        provider_code = None
         try:
             data = response.json()
+            if isinstance(data, dict) and type(data.get("code")) is int:
+                provider_code = data["code"]
             if response.status != 200 or not isinstance(data, dict) or data.get("code") != 2000:
                 raise _NativeRejected("storage_rejected")
             payload = data.get("data")
@@ -527,6 +530,7 @@ class _StudioSession:
                 reason = exc.reason if isinstance(exc, _NativeRejected) else "inline_commit_invalid"
                 self.error = (PublishUncertainError("Native video confirmation conflicted after publication; inspect the account")
                               if self.gate.used else UploadError("Native Studio video storage response could not be verified", stage="studio inline commit",
+                                                                 status=response.status, provider_code=provider_code,
                                                                  diagnostics={"native": "reason=" + reason}))
         return True
 
