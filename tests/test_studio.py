@@ -142,7 +142,7 @@ def session_without_browser():
     session.error = session.media_id = session.session_key = session.result = None
     session.committed = False
     session.video_candidates = set()
-    session.aux_keys, session.aux_vids, session.aux_unkeyed = set(), set(), False
+    session.aux_keys, session.aux_vids = set(), set()
     return session
 
 
@@ -241,7 +241,7 @@ def test_empty_video_vid_is_still_rejected_with_bounded_diagnostics():
     assert "secret-key" not in facts["native"] and "tiktokcdn" not in facts["native"]
 
 
-@pytest.mark.parametrize("case", ["unknown_key", "image_names_video", "key_collision", "vid_collision", "unknown_empty_key"])
+@pytest.mark.parametrize("case", ["unknown_key", "image_names_video", "key_collision", "vid_collision", "unknown_empty_key", "image_empty_key"])
 def test_auxiliary_commits_never_select_video_and_ambiguity_fails_closed(case):
     session = session_without_browser()
     video_apply(session)
@@ -249,6 +249,10 @@ def test_auxiliary_commits_never_select_video_and_ambiguity_fails_closed(case):
         image_apply(session, key="key-1")
     elif case == "vid_collision":
         image_apply(session, vid="video-1")
+    elif case == "image_empty_key":
+        image_apply(session, key="")
+        assert isinstance(session.error, UploadError) and session.error.diagnostics["reason"] == "session_key_invalid"
+        return
     else:
         image_apply(session)
     key, results = "image-key", [{"Vid": ""}]

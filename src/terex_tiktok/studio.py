@@ -204,7 +204,6 @@ class _StudioSession:
         self.video_candidates: set[tuple[str, str]] = set()
         self.aux_keys: set[str] = set()
         self.aux_vids: set[str] = set()
-        self.aux_unkeyed = False
         self.committed = False
         self.result = None
         self.closed = False
@@ -382,6 +381,8 @@ class _StudioSession:
                 self.error = exc
 
     def _apply(self, file_type: str, data, facts: dict):
+        if file_type not in ("video", "image"):
+            raise _NativeRejected("file_type_unsupported")
         nodes = data["Result"]["InnerUploadAddress"]["UploadNodes"]
         if not isinstance(nodes, list):
             raise _NativeRejected("node_list_invalid")
@@ -391,7 +392,6 @@ class _StudioSession:
             raise _NativeRejected("node_count_invalid")
         video = file_type == "video"
         candidates, keys, vids, storage = set(), set(), set(), set()
-        unkeyed = False
         for node in nodes:
             if not isinstance(node, dict):
                 raise _NativeRejected("node_invalid")
@@ -400,27 +400,21 @@ class _StudioSession:
             except (KeyError, TypeError, ValueError):
                 raise _NativeRejected("storage_invalid") from None
             key, vid = node.get("SessionKey"), node.get("Vid")
+            try:
+                key = _upload_string(key, 8192)
+            except ValueError:
+                raise _NativeRejected("session_key_invalid") from None
             if video:
-                try:
-                    key = _upload_string(key, 8192)
-                except ValueError:
-                    raise _NativeRejected("session_key_invalid") from None
                 try:
                     vid = _upload_string(vid, 256)
                 except ValueError:
                     raise _NativeRejected("vid_invalid") from None
                 candidates.add((key, vid))
                 continue
-            # Auxiliary uploads, such as the cover image, may carry empty
-            # identities. They are tracked only so their commits cannot be
+            # Cover images may carry an empty Vid, but the observed response
+            # still has a session key. Track it so commits cannot be
             # confused with the video; they can never select media_id.
-            if key is None or key == "":
-                unkeyed = True
-            else:
-                try:
-                    keys.add(_upload_string(key, 8192))
-                except ValueError:
-                    raise _NativeRejected("session_key_invalid") from None
+            keys.add(key)
             if vid is not None and not isinstance(vid, str):
                 raise _NativeRejected("vid_invalid")
             if vid:
@@ -441,7 +435,6 @@ class _StudioSession:
         # transfer permissions. Node order never selects the video.
         self.video_candidates.update(candidates)
         self.aux_keys, self.aux_vids = aux_keys, aux_vids
-        self.aux_unkeyed = self.aux_unkeyed or unkeyed
         self.gate.storage_paths.update(storage)
 
     def _commit(self, request, data, facts: dict):
@@ -449,11 +442,15 @@ class _StudioSession:
             key = request.post_data_json["SessionKey"]
         except (KeyError, TypeError, ValueError):
             key = None
+        try:
+            key = _upload_string(key, 8192)
+        except ValueError:
+            raise _NativeRejected("commit_session_invalid") from None
         result = data.get("Result") if isinstance(data, dict) else None
         results = result.get("Results") if isinstance(result, dict) else None
         facts["results"] = len(results) if isinstance(results, list) else 0
         video_vids = {vid for _, vid in self.video_candidates}
-        if (key in (None, "") and self.aux_unkeyed) or (isinstance(key, str) and key in self.aux_keys):
+        if key in self.aux_keys:
             if isinstance(key, str) and key in {k for k, _ in self.video_candidates}:
                 raise _NativeRejected("identity_conflict")
             # A known auxiliary commit is never video proof, but it must not
@@ -462,10 +459,6 @@ class _StudioSession:
                                                  for item in results[:MAX_UPLOAD_NODES]):
                 raise _NativeRejected("commit_identity_ambiguous")
             return
-        try:
-            key = _upload_string(key, 8192)
-        except ValueError:
-            raise _NativeRejected("commit_session_invalid") from None
         if not isinstance(results, list) or not 1 <= len(results) <= MAX_UPLOAD_NODES:
             raise _NativeRejected("commit_results_invalid")
         try:
