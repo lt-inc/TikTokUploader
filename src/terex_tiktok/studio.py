@@ -120,6 +120,7 @@ class _PublishGate:
         self.request = None
         self.error: Exception | None = None
         self.storage_paths: set[tuple[str, str]] = set()
+        self.blocked_storage_requests = 0
 
     @staticmethod
     def storage_for(node: dict) -> set[tuple[str, str]]:
@@ -153,6 +154,11 @@ class _PublishGate:
                 return True
             if parts.path.rstrip("/") == "/top/v1" and query.get("Action", [None])[0] in ("ApplyUploadInner", "CommitUploadInner"):
                 return True
+        # Current native SDK uses a single POST with no query. The exact
+        # object and host still come only from its authenticated Apply response.
+        if (request.method == "POST" and not parts.query and parts.path.startswith("/upload/v1/")
+                and (parts.netloc.lower(), parts.path[len("/upload/v1"):]) in self.storage_paths):
+            return True
         return (request.method in ("POST", "PUT") and (parts.netloc.lower(), parts.path) in self.storage_paths
                 and query.get("phase", [None])[0] in ("transfer", "finish"))
 
@@ -167,6 +173,8 @@ class _PublishGate:
                 if self._allowed_preparation(request):
                     route.continue_()
                 else:
+                    if urlparse(request.url).netloc.lower() in {host for host, _ in self.storage_paths}:
+                        self.blocked_storage_requests = min(1000, self.blocked_storage_requests + 1)
                     # Unknown mutations, including a changed publication API,
                     # never leave the browser. Dropped telemetry is harmless.
                     route.abort("blockedbyclient")
@@ -274,7 +282,8 @@ class _StudioSession:
         self.check()
         if self.gate.used:
             raise PublishUncertainError(message + "; the native publish request may have succeeded")
-        raise UploadError(message, stage="studio wait")
+        raise UploadError(message, stage="studio wait", diagnostics={
+            "native": f"reason=wait_timeout blocked_storage={self.gate.blocked_storage_requests}"})
 
     def on_request_failed(self, request):
         if request == self.gate.request and self.error is None:

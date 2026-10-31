@@ -44,6 +44,23 @@ class Route:
         self.aborted += 1
 
 
+@pytest.mark.parametrize("url,method,allowed", [
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", True),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/other", "POST", False),
+    ("https://other.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object?delete=1", "POST", False),
+    ("https://storage.tiktokcdn.com/upload/v1/bucket/object", "PUT", False),
+    ("http://storage.tiktokcdn.com/upload/v1/bucket/object", "POST", False),
+])
+def test_native_single_post_is_bound_to_allocated_storage_object(url, method, allowed):
+    gate = studio._PublishGate(prepared(), lambda: None)
+    gate.storage_paths.add(("storage.tiktokcdn.com", "/bucket/object"))
+    route = Route(url=url, method=method)
+    gate.route(route)
+    assert bool(route.continued) is allowed
+    assert not gate.used and gate.error is None
+
+
 def test_unarmed_publish_and_following_valid_request_never_reach_network():
     gate = studio._PublishGate(prepared(), lambda: None)
     first = Route()
