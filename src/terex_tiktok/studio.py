@@ -37,6 +37,7 @@ MAX_UPLOAD_NODES = 16
 MAX_STORE_INFOS = 16
 MAX_APPLY_BODY = 1 << 20
 MAX_NATIVE_STORAGE_REQUESTS = 1024
+MAX_STORAGE_NETWORK_IDS = 4096
 _NATIVE_FACTS = ("action", "file_type", "reason", "nodes", "empty_vid", "empty_key", "invalid_store", "results")
 
 
@@ -297,6 +298,9 @@ class _StudioSession:
         self.closed = False
         self.proxy = account.get_proxy()
         self.auth_attempts: set[str] = set()
+        self.storage_network_ids: set[str] = set()
+        self.failed_storage_network_ids: set[str] = set()
+        self.storage_cancellations = 0
         try:
             self.stack.enter_context(browser_permit(guard=wait_guard, label=label))
             pw = self.stack.enter_context(sync_playwright())
@@ -324,6 +328,8 @@ class _StudioSession:
             self.stack.callback(self.cdp.detach)
             self.cdp.on("Fetch.requestPaused", self.on_response_paused)
             self.cdp.on("Fetch.authRequired", self.on_auth_required)
+            self.cdp.on("Network.loadingFailed", self.on_network_failed)
+            self.cdp.send("Network.enable", {"maxPostDataSize": 1024})
             self.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}],
                                            "handleAuthRequests": True})
             self.cdp_apply = True
@@ -365,11 +371,18 @@ class _StudioSession:
             raise PublishUncertainError(message + "; the native publish request may have succeeded")
         raise UploadError(message, stage="studio wait", diagnostics={
             "native": (f"reason=wait_timeout blocked_storage={self.gate.blocked_storage_requests} "
-                       f"apply_cdp={self.apply_intercepted} {self.gate.blocked_shape}").strip()})
+                       f"apply_cdp={self.apply_intercepted} cancelled_storage={self.storage_cancellations} {self.gate.blocked_shape}").strip()})
 
     def on_request_failed(self, request):
         if request == self.gate.request and self.error is None:
             self.error = PublishUncertainError("The Studio publish response was lost; inspect the account")
+
+    def on_network_failed(self, event):
+        # Network IDs join Fetch interception to a positive Chromium failure.
+        # URLs, credentials and request bodies are never retained for this join.
+        network_id = event.get("requestId")
+        if isinstance(network_id, str) and network_id in self.storage_network_ids:
+            self.failed_storage_network_ids.add(network_id)
 
     def on_auth_required(self, event):
         response = {"response": "CancelAuth"}
@@ -408,7 +421,17 @@ class _StudioSession:
         response_stage = "responseStatusCode" in event or "responseErrorReason" in event
         observed = self._upload_action(request["url"])
         apply = observed[1] if observed and observed[0] == "ApplyUploadInner" else None
+        parts = urlparse(request["url"])
+        target = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+        known_storage = (request["method"] == "POST" and parts.scheme == "https"
+                         and parts.path.startswith("/upload/v1/") and target in self.gate.storage_paths)
+        network_id = event.get("networkId")
         try:
+            if (not response_stage and known_storage and isinstance(network_id, str)
+                    and self.gate._allowed_preparation(SimpleNamespace(url=request["url"], method=request["method"]))):
+                if len(self.storage_network_ids) >= MAX_STORAGE_NETWORK_IDS and network_id not in self.storage_network_ids:
+                    raise _NativeRejected("network_tracking_limit")
+                self.storage_network_ids.add(network_id)
             if not response_stage:
                 self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"],
                                                         "interceptResponse": mutation or apply is not None})
@@ -428,10 +451,36 @@ class _StudioSession:
                 self.cdp.send("Fetch.failRequest", {"requestId": event["requestId"], "errorReason": "BlockedByClient"})
             else:
                 self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]})
-        except Exception:
+        except Exception as exc:
             if self.error is None:
+                text = str(exc)
+                reason = ("interception_cancelled" if "Invalid InterceptionId" in text or "Invalid interception id" in text
+                          else "body_unavailable" if "response body" in text.lower()
+                          else "target_closed" if "closed" in text.lower()
+                          else "protocol_error" if "Protocol error" in text else type(exc).__name__)
+                reason = reason if reason in ("interception_cancelled", "body_unavailable", "target_closed", "protocol_error", "TimeoutError", "Error") else "other"
+                if (reason == "interception_cancelled" and known_storage and not self.gate.armed and not self.gate.used
+                        and isinstance(network_id, str) and network_id in self.storage_network_ids):
+                    if network_id not in self.failed_storage_network_ids:
+                        # The loadingFailed notification may be queued just
+                        # behind the stale Fetch interception. Pump it briefly;
+                        # absence remains fatal, never evidence of cancellation.
+                        try:
+                            self.page.wait_for_timeout(50)
+                        except Exception:
+                            pass
+                    if network_id in self.failed_storage_network_ids:
+                        self.storage_cancellations = min(1000, self.storage_cancellations + 1)
+                        return
+                network_error = event.get("responseErrorReason")
+                network_error = network_error if network_error in ("Aborted", "Failed", "TimedOut", "ConnectionClosed", "BlockedByClient") else "none"
+                host = urlparse(request["url"]).netloc.lower()
+                storage = int(host in {h for h, _ in self.gate.storage_paths})
+                facts = (f"reason={reason} response_stage={int(response_stage)} mutation={int(mutation)} storage={storage} network_error={network_error} "
+                         f"network_tracked={int(network_id in self.storage_network_ids)} network_failed={int(network_id in self.failed_storage_network_ids)}")
                 self.error = (PublishUncertainError("Studio response interception failed after publication") if self.gate.used
-                              else UploadError("Studio response interception failed", stage="studio redirect guard"))
+                              else UploadError("Studio response interception failed", stage="studio redirect guard",
+                                               status=event.get("responseStatusCode"), diagnostics={"native": facts}))
 
     @staticmethod
     def _upload_action(url: str):
