@@ -4,16 +4,19 @@ import secrets
 import contextlib
 import threading
 import time
+import logging
 from datetime import datetime, timezone
 
 from autotok.browsers import sync_playwright
 
-from .browser import browser_permit, open_context
+from .browser import browser_permit, open_context, session_cookies
 from .captcha import CaptchaProvider
 from .connections import Connections
-from .identity import SessionRejected, checked_cookies, verify_identity
+from .identity import SessionRejected, verify_identity
 from .metrics import HELP
 from .routing import proxy_for
+
+log = logging.getLogger("tiktok.help")
 
 
 class BrowserHelp:
@@ -103,7 +106,7 @@ class BrowserHelp:
                     if not session["finish"].is_set() or challenge.is_visible() or "/login" in page.url:
                         raise SessionRejected("Complete the TikTok verification before publishing")
                 guard()
-                cookies = checked_cookies(context.cookies())
+                cookies = session_cookies(context)
                 identity = verify_identity(cookies, row["user_agent"], proxy_for(row, self.config))
                 if identity.remote_account_id != row["remote_account_id"]:
                     raise SessionRejected("A different TikTok account is logged in")
@@ -150,7 +153,7 @@ class BrowserHelp:
                     while time.time() < session["expires_at"] and not session["stop"].is_set():
                         self.require(token)
                         if session["finish"].is_set():
-                            cookies = checked_cookies(context.cookies())
+                            cookies = session_cookies(context)
                             agent = page.evaluate("navigator.userAgent")
                             identity = verify_identity(cookies, agent, proxy_for(row, self.config))
                             self.connections.accept(session["account_id"], cookies, agent, identity, session["version"], session["pairing_generation"])
@@ -164,5 +167,7 @@ class BrowserHelp:
                     browser.close()
                     HELP.dec()
         except Exception as exc:
+            log.warning("browser verification failed account_id=%s session_version=%s error_type=%s",
+                        session["account_id"], session["version"], type(exc).__name__)
             session.update(status="failed", error=f"Browser verification failed ({type(exc).__name__}); reconnect or try again")
             session["ready"].set()

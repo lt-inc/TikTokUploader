@@ -27,6 +27,11 @@ not establish current TikTok compatibility or guaranteed reach.
    the challenge in the temporary browser and press **I have finished**. Return
    to the account and press **Check** to refresh the session version.
 
+Browser verification and Studio retain only `tiktok.com` and its subdomains'
+cookies for the authenticated HTTP session. Regional/third-party cookies set by
+the site stay in the temporary browser, not in the exported session. Extension
+imports still reject foreign domains and partitioned cookies.
+
 The extension reads only TikTok cookies, including HttpOnly session cookies. It
 does not save exports or codes on disk and does not inspect other browser
 accounts. A consumed/expired code must be regenerated. If the response is lost,

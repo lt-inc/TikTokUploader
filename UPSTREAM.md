@@ -66,6 +66,11 @@ hairpin path, keeping the validated original URL's exact signed path/query and H
 header. Diagnostics gain `media_route=internal|public`. No fallback, retry, proxy
 or credential change; the network root cause is not asserted by this change.
 
+LT-Inc follow-up (2026-10-30): browser-help completion and pre-publication
+verification now share Studio's first-party cookie selection. TikTok can set
+regional `.tiktokw.eu` cookies; validating the entire browser jar incorrectly
+rejected an otherwise valid login. External session imports remain strict.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through
