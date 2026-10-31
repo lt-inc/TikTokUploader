@@ -198,6 +198,8 @@ def session_without_browser():
     session.video_candidates = set()
     session.aux_keys, session.aux_vids = set(), set()
     session.video_storage = {}
+    session.storage_network_ids, session.failed_storage_network_ids = set(), set()
+    session.storage_cancellations = 0
     return session
 
 
@@ -511,6 +513,112 @@ def test_lost_final_response_is_uncertain_and_never_arms_a_second_send():
     second = Route()
     session.gate.route(second)
     assert second.continued == 0
+
+
+STORAGE_SECRET = "https://storage.tiktokcdn.com/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web"
+CANCELLED = "Protocol error (Fetch.continueRequest): Invalid InterceptionId. " + STORAGE_SECRET + " Bearer secret-bearer secret-token"
+
+
+def storage_session(raises, *, failed=(), page_failures=()):
+    session = session_without_browser()
+    session.gate.storage_paths.add(("storage.tiktokcdn.com", "/bucket/object"))
+    calls = []
+    def send(method, payload):
+        calls.append((method, payload["requestId"]))
+        if method == "Fetch.continueRequest" and "responseStatusCode" in current and raises is not None:
+            raise raises
+    current = {}
+    session.cdp = SimpleNamespace(send=send)
+    def pump(_milliseconds):
+        for network_id in page_failures:
+            session.on_network_failed({"requestId": network_id, "errorText": "net::ERR_ABORTED", "canceled": True})
+    session.page = SimpleNamespace(wait_for_timeout=pump)
+    def paused(url=STORAGE_SECRET, *, network_id="net-1", method="POST", **response):
+        current.clear()
+        current.update(response)
+        session.on_response_paused({"requestId": "interception-1", "networkId": network_id,
+                                    "request": {"url": url, "method": method}, **response})
+    for network_id in failed:
+        session.on_network_failed({"requestId": network_id, "errorText": "net::ERR_ABORTED", "canceled": True})
+    return session, calls, paused
+
+
+def assert_no_secret(error):
+    text = repr(getattr(error, "diagnostics", None)) + str(error)
+    for secret in ("secret-", "storage.tiktokcdn.com", "12345678", "net-1", "interception-1", "Bearer"):
+        assert secret not in text
+
+
+def test_confirmed_aborted_native_storage_interception_is_ignored_once():
+    session, calls, paused = storage_session(RuntimeError(CANCELLED))
+    paused()
+    assert session.storage_network_ids == {"net-1"}
+    session.on_network_failed({"requestId": "net-1", "errorText": "net::ERR_ABORTED", "canceled": True})
+    assert session.failed_storage_network_ids == {"net-1"}
+    paused(responseStatusCode=200)
+    assert session.error is None and session.storage_cancellations == 1
+    assert not session.gate.armed and not session.gate.used
+    assert calls == [("Fetch.continueRequest", "interception-1")] * 2
+
+
+def test_late_queued_loading_failed_is_collected_by_bounded_pump():
+    session, calls, paused = storage_session(RuntimeError(CANCELLED), page_failures=["net-1"])
+    paused()
+    paused(responseStatusCode=200)
+    assert session.error is None and session.storage_cancellations == 1
+
+
+@pytest.mark.parametrize("failure", ["none", "other_id", "untracked_only"])
+def test_cancelled_interception_without_exact_loading_failed_is_fatal(failure):
+    session, _, paused = storage_session(RuntimeError(CANCELLED),
+                                         failed=["other"] if failure != "none" else (),
+                                         page_failures=["other"] if failure == "other_id" else ())
+    if failure != "untracked_only":
+        paused()
+    paused(responseStatusCode=200)
+    assert isinstance(session.error, UploadError) and not isinstance(session.error, PublishUncertainError)
+    assert session.storage_cancellations == 0 and session.failed_storage_network_ids == set()
+    assert "reason=interception_cancelled" in session.error.diagnostics["native"]
+    assert_no_secret(session.error)
+
+
+def test_unrelated_network_failure_is_not_accepted():
+    session, _, paused = storage_session(None)
+    paused()
+    session.on_network_failed({"requestId": "net-unrelated", "errorText": "net::ERR_ABORTED"})
+    assert session.storage_network_ids == {"net-1"} and session.failed_storage_network_ids == set()
+
+
+@pytest.mark.parametrize("state", ["used", "armed"])
+def test_final_publish_interception_loss_is_never_tolerated(state):
+    session, _, paused = storage_session(RuntimeError(CANCELLED), failed=["net-1"])
+    paused()
+    setattr(session.gate, state, True)
+    paused(responseStatusCode=200)
+    assert session.storage_cancellations == 0
+    assert isinstance(session.error, PublishUncertainError if state == "used" else UploadError)
+    assert_no_secret(session.error)
+
+
+@pytest.mark.parametrize("case", ["target_closed", "unknown", "host", "method"])
+def test_only_known_cancelled_storage_interception_is_tolerated(case):
+    error = {"target_closed": RuntimeError("Target page, context or browser has been closed " + STORAGE_SECRET),
+             "unknown": RuntimeError("fixture failure " + STORAGE_SECRET)}.get(case, RuntimeError(CANCELLED))
+    session, _, paused = storage_session(error, failed=["net-1"])
+    url = "https://other.example/upload/v1/bucket/object?uploadid=12345678-1234-4234-8234-123456789abc&device_platform=web" if case == "host" else STORAGE_SECRET
+    method = "PUT" if case == "method" else "POST"
+    paused(url, method=method)
+    paused(url, method=method, responseStatusCode=200)
+    assert isinstance(session.error, UploadError) and session.storage_cancellations == 0
+    assert_no_secret(session.error)
+
+
+def test_real_storage_redirect_remains_blocked_even_after_network_failure():
+    session, calls, paused = storage_session(None, failed=["net-1"])
+    paused()
+    paused(responseStatusCode=307)
+    assert isinstance(session.error, UploadError) and session.error.stage == "studio redirect"
+    assert calls[-1] == ("Fetch.failRequest", "interception-1") and session.storage_cancellations == 0
 
 
 @pytest.mark.parametrize("case", ["match", "server", "host", "port", "scheme", "malformed", "repeat", "fenced", "send_failure"])
