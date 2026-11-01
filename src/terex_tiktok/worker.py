@@ -287,7 +287,21 @@ class Worker:
                         prepared["session"].close()
                 self._checkpoint(lease, journal, "verifying", submitting=True)
                 with STAGES.labels("verify").time():
-                    proof = inspect_posts(row, journal, proxy_for(row, self.config), guard)
+                    proof = None
+                    for check_index in range(3 if studio else 1):
+                        if check_index:
+                            # Studio can accept a post before creator management
+                            # lists it. Reopen only the read-only listing; the
+                            # submitted project and final-send fence stay intact.
+                            log.info("post confirmation pending; checking owner listing again %s check=%s",
+                                     context, check_index + 1)
+                            for _ in range(20):
+                                guard()
+                                self.stop.wait(1)
+                        guard()
+                        proof = inspect_posts(row, journal, proxy_for(row, self.config), guard)
+                        if proof:
+                            break
                 if not proof:
                     self._failure(lease, "needs_attention", "upload_unknown", "TikTok accepted the request, but the actual post is not yet verified. No automatic re-upload.")
                     UPLOADS.labels("unverified").inc()
