@@ -133,6 +133,37 @@ def test_native_payload_mismatch_blocks_publication_before_checkpoint(change):
     assert isinstance(gate.error, UploadError) and not gate.used and route.continued == 0
 
 
+@pytest.mark.parametrize("change", [None, "enabled_reuse", "enabled_ai", "mixed", "missing", "bool_reuse", "requested_duet"])
+def test_unified_reuse_privacy_requires_explicit_disabled_permissions_before_send(change):
+    payload, state = native_payload(), prepared()
+    privacy = payload["feature_common_info_list"][0]["privacy_setting_info"]
+    privacy.update(allow_duet=None, allow_stitch=None, allow_content_reuse=0, allow_ai_remix=2)
+    if change == "enabled_reuse":
+        privacy["allow_content_reuse"] = 1
+    elif change == "enabled_ai":
+        privacy["allow_ai_remix"] = 1
+    elif change == "mixed":
+        privacy["allow_duet"] = 0
+    elif change == "missing":
+        del privacy["allow_content_reuse"]
+    elif change == "bool_reuse":
+        privacy["allow_content_reuse"] = False
+    elif change == "requested_duet":
+        state["allow_duet"] = True
+    gate = studio._PublishGate(state, lambda: None)
+    checkpoints = []
+    gate.armed = True
+    gate.before_send = lambda: checkpoints.append(True)
+    route = Route(payload)
+    gate.route(route)
+    assert gate.used is (change is None)
+    assert route.continued == int(change is None)
+    assert checkpoints == ([True] if change is None else [])
+    if change:
+        assert isinstance(gate.error, UploadError)
+        assert gate.error.diagnostics == {"native": "reason=publish_interactivity"}
+
+
 @pytest.mark.parametrize("failure_at", ["guard", "barrier", "second_guard"])
 def test_fencing_failure_is_preserved_and_prevents_native_send(failure_at):
     calls = []
@@ -549,6 +580,25 @@ def assert_no_secret(error):
         assert secret not in text
 
 
+def test_response_interception_keeps_admitted_routes_at_storage_cap_but_skips_dropped_telemetry():
+    session = session_without_browser()
+    key = ("storage.tiktokcdn.com", "/bucket/object")
+    session.gate.storage_paths.add(key)
+    session.gate.native_storage_requests[key] = studio.MAX_NATIVE_STORAGE_REQUESTS
+    calls = []
+    session.cdp = SimpleNamespace(send=lambda method, payload: calls.append((method, payload)))
+    for url, expected in (
+        (STORAGE_SECRET, True),
+        ("https://www.tiktok.com/top/v1?Action=CommitUploadInner", True),
+        ("https://www.tiktok.com/tiktok/web/project/create/v1/", True),
+        ("https://www.tiktok.com/tiktok/web/project/post/v1/", True),
+        ("https://www.tiktok.com/unrecognized/telemetry", False),
+    ):
+        session.on_response_paused({"requestId": "fixture", "request": {"url": url, "method": "POST"}})
+        assert calls[-1] == ("Fetch.continueRequest", {"requestId": "fixture", "interceptResponse": expected})
+    assert session.error is None and not session.gate.used
+
+
 def test_confirmed_aborted_native_storage_interception_is_ignored_once():
     session, calls, paused = storage_session(RuntimeError(CANCELLED))
     paused()
@@ -667,7 +717,17 @@ HTML = """<!doctype html><html><body>
 <section><label>Duet</label><div><input type="checkbox" checked id="duet"></div></section>
 <section><label>Stitch</label><div><input type="checkbox" checked id="stitch"></div></section>
 <button data-e2e="post_video_button" disabled data-disabled="true" onclick="publish()">Post</button>
+<div id="tour" hidden><div class="react-joyride__overlay" style="position:fixed;inset:0;z-index:10"></div>
+<div class="react-joyride__tooltip" style="position:fixed;top:20px;left:20px;z-index:11">
+<button onclick="document.querySelector('#tour').remove()">Got it</button></div></div>
 <script>
+const unified=new URLSearchParams(location.search).has('unified');
+if (unified) {
+ document.querySelector('#duet').closest('section').remove();document.querySelector('#stitch').closest('section').remove();
+ const reuse=document.createElement('div');reuse.id='additional';reuse.hidden=true;
+ reuse.innerHTML='<label><input type="checkbox" id="reuse" hidden checked>Reuse of content</label>';document.body.prepend(reuse);
+ const expand=document.createElement('button');expand.textContent='Show more';expand.onclick=()=>{reuse.hidden=false;expand.remove()};document.body.prepend(expand);
+}
 function privacy(el) {document.querySelector('[role=combobox]').textContent=el.textContent; document.querySelector('#options').hidden=true;}
 setTimeout(() => {
  document.querySelector('#inputs').innerHTML='<input type="file" accept="video/mp4">';
@@ -676,6 +736,7 @@ setTimeout(() => {
   await fetch('/top/v1?Action=ApplyUploadInner&FileType=video');
   await fetch('/top/v1?Action=CommitUploadInner', {method:'POST',body:JSON.stringify({SessionKey:'upload-session-1'})});
   const post=document.querySelector('[data-e2e=post_video_button]'); post.disabled=false; post.dataset.disabled='false';
+  document.querySelector('#tour').hidden=false;
  };
 }, 350);
 fetch('/api/new-unknown-mutation', {method:'POST',body:'{}'}).catch(()=>{});
@@ -684,8 +745,9 @@ async function publish() {
  const payload={post_common_info:{creation_id:'native-project-1'},
   feature_common_info_list:[{vedit_common_info:{video_id:id},privacy_setting_info:{
     visibility_type:document.querySelector('[role=combobox]').textContent==='Only you'?1:0,
-    allow_comment:+document.querySelector('#comment').checked,allow_duet:+document.querySelector('#duet').checked,
-    allow_stitch:+document.querySelector('#stitch').checked}}],
+    allow_comment:+document.querySelector('#comment').checked,allow_duet:unified?null:+document.querySelector('#duet').checked,
+    allow_stitch:unified?null:+document.querySelector('#stitch').checked,
+    ...(unified?{allow_content_reuse:+document.querySelector('#reuse').checked,allow_ai_remix:2}:{})}}],
   single_post_req_list:[{video_id:id,single_post_feature_info:{text:document.querySelector('[contenteditable]').textContent}}]};
  await fetch('/tiktok/web/project/post/v1/',{method:'POST',body:JSON.stringify(payload)});
 }
@@ -768,7 +830,7 @@ def test_local_chromium_native_upload_fences_and_redirects(tmp_path, monkeypatch
     original_preparation = studio._PublishGate._allowed_preparation
     # Only the fixture origin is substituted. Production checks remain HTTPS
     # www.tiktok.com; separate unit tests exercise rejection of other origins.
-    monkeypatch.setattr(studio, "STUDIO_URL", origin + "/tiktokstudio/upload")
+    monkeypatch.setattr(studio, "STUDIO_URL", origin + "/tiktokstudio/upload" + ("?unified=1" if use_proxy else ""))
     monkeypatch.setattr(studio, "_studio_origin", lambda url: url.startswith(origin + "/") or original_origin(url))
     def preparation(gate, request):
         if request.url.startswith(origin + "/"):

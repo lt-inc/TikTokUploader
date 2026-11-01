@@ -90,6 +90,7 @@ def _publish_path(request) -> str | None:
 
 def _validated_creation(payload, prepared: dict) -> str:
     """Accept only the one-video native payload whose settings we authorized."""
+    reason = "schema"
     try:
         common = payload["post_common_info"]
         features = payload["feature_common_info_list"]
@@ -98,24 +99,45 @@ def _validated_creation(payload, prepared: dict) -> str:
             raise ValueError
         feature, post = features[0], posts[0]
         privacy = feature["privacy_setting_info"]
+        reason = "visibility"
         if type(privacy["visibility_type"]) is not int or privacy["visibility_type"] != prepared["visibility"]:
             raise ValueError
-        for name in ("allow_comment", "allow_duet", "allow_stitch"):
-            if type(privacy[name]) is not int or privacy[name] != int(prepared[name]):
+        reason = "interactivity"
+        if type(privacy["allow_comment"]) is not int or privacy["allow_comment"] != int(prepared["allow_comment"]):
+            raise ValueError
+        legacy = (privacy["allow_duet"], privacy["allow_stitch"])
+        if all(type(value) is int for value in legacy):
+            if legacy != (int(prepared["allow_duet"]), int(prepared["allow_stitch"])):
                 raise ValueError
+        elif legacy != (None, None) or prepared["allow_duet"] or prepared["allow_stitch"]:
+            raise ValueError
+        # Current Studio replaces Duet/Stitch with a broader reuse permission.
+        # Support only disabled reuse. Its native SDK encodes AI remix as 1
+        # enabled / 2 disabled, unlike the 0/1 content-reuse flag.
+        if legacy == (None, None) or any(name in privacy for name in ("allow_content_reuse", "allow_ai_remix")):
+            if (prepared["allow_duet"] or prepared["allow_stitch"]
+                    or type(privacy["allow_content_reuse"]) is not int or privacy["allow_content_reuse"] != 0
+                    or type(privacy["allow_ai_remix"]) is not int or privacy["allow_ai_remix"] != 2):
+                raise ValueError
+        reason = "caption"
         if post["single_post_feature_info"]["text"] != prepared["caption"]:
             raise ValueError
+        reason = "media"
         if not prepared.get("media_id") or str(post["video_id"]) != prepared["media_id"]:
             raise ValueError
-        if str(feature["vedit_common_info"]["video_id"]) != prepared["media_id"] or feature.get("schedule_time"):
+        if str(feature["vedit_common_info"]["video_id"]) != prepared["media_id"]:
+            raise ValueError
+        reason = "schedule"
+        if feature.get("schedule_time"):
             raise ValueError
         creation = common["creation_id"]
+        reason = "creation"
         if not isinstance(creation, str) or not 1 <= len(creation) <= 256:
             raise ValueError
         return creation
     except (KeyError, IndexError, TypeError, ValueError):
         raise UploadError("Studio publish payload does not match the authorized video, caption or privacy settings",
-                          stage="studio publish validation") from None
+                          stage="studio publish validation", diagnostics={"native": f"reason=publish_{reason}"}) from None
 
 
 class _PublishGate:
@@ -433,8 +455,14 @@ class _StudioSession:
                     raise _NativeRejected("network_tracking_limit")
                 self.storage_network_ids.add(network_id)
             if not response_stage:
+                # The request gate aborts unknown mutations (including telemetry).
+                # Do not ask Fetch for a response to those deliberate aborts:
+                # its stale interception can otherwise look like a failed upload.
+                candidate = SimpleNamespace(url=request["url"], method=request["method"])
+                intercept = (apply is not None or _publish_path(candidate) is not None
+                             or known_storage or (mutation and self.gate._allowed_preparation(candidate)))
                 self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"],
-                                                        "interceptResponse": mutation or apply is not None})
+                                                        "interceptResponse": intercept})
             elif apply is not None and "responseStatusCode" in event and not (300 <= event["responseStatusCode"] < 400):
                 # The SDK may start native storage immediately after reading
                 # Apply, before any asynchronous Playwright response callback.
@@ -797,16 +825,67 @@ class BrowserStudioClient:
         prepared["media_id"] = session.media_id
         return session.media_id
 
+    def _set_checkbox(self, session, label, desired):
+        wrapper = session.page.get_by_text(label, exact=True).locator("xpath=ancestor-or-self::label[1]")
+        control = wrapper.locator("input[type='checkbox']")
+        if control.count() == 0:
+            control = session.page.locator(f"xpath=//label[.='{label}']/following-sibling::div/input")
+        if control.count() == 0:
+            return False
+        if control.count() != 1:
+            raise UploadError("Studio privacy control is ambiguous", stage="studio privacy",
+                              diagnostics={"native": f"reason=privacy_ambiguous controls={control.count()} wrappers={wrapper.count()}"})
+        if control.is_checked() != desired:
+            if wrapper.count() == 1 and not wrapper.is_visible():
+                expand = session.page.get_by_text("Show more", exact=True)
+                if expand.count() == 1 and expand.is_visible():
+                    expand.click(timeout=self.timeout * 1000)
+                    session.wait(lambda: wrapper.is_visible(), self.timeout,
+                                 "Studio additional privacy settings did not open")
+            if wrapper.count() == 1 and wrapper.is_visible() and wrapper.locator("input").count() == 1:
+                # The current native component hides its input. Activate its
+                # exact visible label, then prove the real input state changed.
+                wrapper.click(timeout=self.timeout * 1000)
+            elif control.is_visible():
+                control.set_checked(desired, timeout=self.timeout * 1000)
+            else:
+                raise UploadError("Studio privacy control is unavailable", stage="studio privacy",
+                                  diagnostics={"native": f"reason=privacy_unavailable controls={control.count()} wrappers={wrapper.count()}"})
+            session.wait(lambda: control.is_checked() == desired, self.timeout,
+                         "Studio did not retain the requested privacy setting")
+        return True
+
     def prepare_publish(self, prepared):
         session, page = prepared["session"], prepared["session"].page
         session.check()
+        # Studio's first-upload tour can cover Post despite its enabled state.
+        # Dismiss only the known tour through its own visible native control,
+        # before arming publication; never force-click through an unknown layer.
+        overlay = page.locator(".react-joyride__overlay")
+        if overlay.count() == 1 and overlay.is_visible():
+            dismiss = page.locator(".react-joyride__tooltip").get_by_role("button", name="Got it", exact=True)
+            if dismiss.count() != 1 or not dismiss.is_visible():
+                raise UploadError("Studio onboarding needs browser verification", stage="studio onboarding")
+            dismiss.click(timeout=self.timeout * 1000)
+            session.wait(lambda: overlay.count() == 0 or not overlay.is_visible(), self.timeout,
+                         "Studio onboarding did not close")
         editor = page.locator("div[contenteditable='true']")
         session.wait(lambda: editor.count() > 0, self.timeout, "Studio caption editor did not appear")
         if editor.count() != 1:
             raise UploadError("Studio caption editor is missing or ambiguous", stage="studio metadata")
+        # Clear through native keyboard events so the controlled editor state
+        # also drops prior content before the programmatic fill.
+        editor.press("ControlOrMeta+A", timeout=self.timeout * 1000)
+        editor.press("Backspace", timeout=self.timeout * 1000)
         editor.fill(prepared["caption"], timeout=self.timeout * 1000)
-        if editor.inner_text() != prepared["caption"]:
-            raise UploadError("Studio did not retain the exact caption", stage="studio metadata")
+        try:
+            session.wait(lambda: editor.inner_text() == prepared["caption"], self.timeout,
+                         "Studio did not retain the exact caption")
+        except UploadError as exc:
+            if exc.stage != "studio wait":
+                raise
+            raise UploadError("Studio did not retain the exact caption", stage="studio metadata",
+                              diagnostics={"native": "reason=caption_mismatch"}) from None
         label = "Only you" if prepared["visibility"] == 1 else "Everyone"
         dropdown = page.locator("[data-e2e='video_visibility_container'] button[role='combobox']")
         try:
@@ -823,11 +902,17 @@ class BrowserStudioClient:
         except Exception as exc:
             raise UploadError("Studio privacy control was unavailable", stage="studio privacy") from exc
         for label, key in (("Comment", "allow_comment"), ("Duet", "allow_duet"), ("Stitch", "allow_stitch")):
-            control = page.locator(f"xpath=//label[.='{label}']/following-sibling::div/input")
-            if control.count() == 1 and control.is_visible():
-                control.set_checked(bool(prepared[key]), timeout=self.timeout * 1000)
+            self._set_checkbox(session, label, bool(prepared[key]))
             # Some privacy/account types hide these controls. The native payload
             # still has to prove the exact desired values before any final send.
+        reuse = page.get_by_text("Reuse of content", exact=True).locator("xpath=ancestor-or-self::label[1]")
+        if reuse.count():
+            # The unified setting also permits stickers and Story reuse. Only
+            # the conservative disabled representation is supported here.
+            if reuse.count() != 1 or prepared["allow_duet"] or prepared["allow_stitch"]:
+                raise UploadError("Studio cannot represent the requested reuse settings", stage="studio privacy",
+                                  diagnostics={"native": f"reason=reuse_unsupported controls={reuse.count()}"})
+            self._set_checkbox(session, "Reuse of content", False)
         button = page.locator(POST_BUTTON)
         session.wait(lambda: button.count() == 1 and button.is_enabled() and button.get_attribute("data-disabled") != "true",
                      self.timeout, "Studio Post button did not become ready")
