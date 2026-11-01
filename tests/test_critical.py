@@ -208,6 +208,8 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
                 self.closed = True
         def export_cookies(self):
             return cookies("studio-renewed-session")
+    submits, inspections = [], []
+    monkeypatch.setattr(worker.stop, "wait", lambda seconds: False)
     class Provider:
         def __init__(self, *args, **kwargs):
             if upload_mode == "studio":
@@ -217,6 +219,7 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
         def transfer(self, prepared): return "media-123"
         def prepare_publish(self, prepared): pass
         def submit(self, prepared, before_send):
+            submits.append(True)
             prepared["creation_id"] = "studio-native-project"
             before_send()
             return {"aweme_id": "999"}
@@ -232,8 +235,13 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
     def inspect(row, *args):
         # Studio must release the browser gate before reconciliation opens it.
         with browser_permit(timeout=0):
+            inspections.append(True)
+            assert submits == [True]
+            assert store.get("publication", 12)["phase"] == "accepted"
             if upload_mode == "studio":
                 assert row["cookies"][0]["value"] == "studio-renewed-session"
+                if len(inspections) < 3:
+                    return None
             return proof
     monkeypatch.setattr("terex_tiktok.worker.inspect_posts", inspect)
     worker.execute({"publication_id": 12, "attempt_id": "attempt-1", "expected_version": 2})
@@ -242,6 +250,7 @@ def test_go_python_wire_contract_through_real_http_serialization(tmp_path, monke
     journal = store.get("publication", 12)
     assert type(journal["publication_id"]) is int and type(journal["account_id"]) is int
     assert journal["phase"] == "published"
+    assert submits == [True] and len(inspections) == (3 if upload_mode == "studio" else 1)
     renewed = store.get("account", 18)
     renewed["session_version"] = 2
     store.put("account", 18, renewed)
