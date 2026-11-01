@@ -37,6 +37,7 @@ MAX_UPLOAD_NODES = 16
 MAX_STORE_INFOS = 16
 MAX_APPLY_BODY = 1 << 20
 MAX_NATIVE_STORAGE_REQUESTS = 1024
+MAX_STORAGE_NETWORK_IDS = 4096
 _NATIVE_FACTS = ("action", "file_type", "reason", "nodes", "empty_vid", "empty_key", "invalid_store", "results")
 
 
@@ -89,6 +90,7 @@ def _publish_path(request) -> str | None:
 
 def _validated_creation(payload, prepared: dict) -> str:
     """Accept only the one-video native payload whose settings we authorized."""
+    reason = "schema"
     try:
         common = payload["post_common_info"]
         features = payload["feature_common_info_list"]
@@ -97,24 +99,45 @@ def _validated_creation(payload, prepared: dict) -> str:
             raise ValueError
         feature, post = features[0], posts[0]
         privacy = feature["privacy_setting_info"]
+        reason = "visibility"
         if type(privacy["visibility_type"]) is not int or privacy["visibility_type"] != prepared["visibility"]:
             raise ValueError
-        for name in ("allow_comment", "allow_duet", "allow_stitch"):
-            if type(privacy[name]) is not int or privacy[name] != int(prepared[name]):
+        reason = "interactivity"
+        if type(privacy["allow_comment"]) is not int or privacy["allow_comment"] != int(prepared["allow_comment"]):
+            raise ValueError
+        legacy = (privacy["allow_duet"], privacy["allow_stitch"])
+        if all(type(value) is int for value in legacy):
+            if legacy != (int(prepared["allow_duet"]), int(prepared["allow_stitch"])):
                 raise ValueError
+        elif legacy != (None, None) or prepared["allow_duet"] or prepared["allow_stitch"]:
+            raise ValueError
+        # Current Studio replaces Duet/Stitch with a broader reuse permission.
+        # Support only disabled reuse. Its native SDK encodes AI remix as 1
+        # enabled / 2 disabled, unlike the 0/1 content-reuse flag.
+        if legacy == (None, None) or any(name in privacy for name in ("allow_content_reuse", "allow_ai_remix")):
+            if (prepared["allow_duet"] or prepared["allow_stitch"]
+                    or type(privacy["allow_content_reuse"]) is not int or privacy["allow_content_reuse"] != 0
+                    or type(privacy["allow_ai_remix"]) is not int or privacy["allow_ai_remix"] != 2):
+                raise ValueError
+        reason = "caption"
         if post["single_post_feature_info"]["text"] != prepared["caption"]:
             raise ValueError
+        reason = "media"
         if not prepared.get("media_id") or str(post["video_id"]) != prepared["media_id"]:
             raise ValueError
-        if str(feature["vedit_common_info"]["video_id"]) != prepared["media_id"] or feature.get("schedule_time"):
+        if str(feature["vedit_common_info"]["video_id"]) != prepared["media_id"]:
+            raise ValueError
+        reason = "schedule"
+        if feature.get("schedule_time"):
             raise ValueError
         creation = common["creation_id"]
+        reason = "creation"
         if not isinstance(creation, str) or not 1 <= len(creation) <= 256:
             raise ValueError
         return creation
     except (KeyError, IndexError, TypeError, ValueError):
         raise UploadError("Studio publish payload does not match the authorized video, caption or privacy settings",
-                          stage="studio publish validation") from None
+                          stage="studio publish validation", diagnostics={"native": f"reason=publish_{reason}"}) from None
 
 
 class _PublishGate:
@@ -297,6 +320,9 @@ class _StudioSession:
         self.closed = False
         self.proxy = account.get_proxy()
         self.auth_attempts: set[str] = set()
+        self.storage_network_ids: set[str] = set()
+        self.failed_storage_network_ids: set[str] = set()
+        self.storage_cancellations = 0
         try:
             self.stack.enter_context(browser_permit(guard=wait_guard, label=label))
             pw = self.stack.enter_context(sync_playwright())
@@ -324,6 +350,8 @@ class _StudioSession:
             self.stack.callback(self.cdp.detach)
             self.cdp.on("Fetch.requestPaused", self.on_response_paused)
             self.cdp.on("Fetch.authRequired", self.on_auth_required)
+            self.cdp.on("Network.loadingFailed", self.on_network_failed)
+            self.cdp.send("Network.enable", {"maxPostDataSize": 1024})
             self.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}],
                                            "handleAuthRequests": True})
             self.cdp_apply = True
@@ -365,11 +393,18 @@ class _StudioSession:
             raise PublishUncertainError(message + "; the native publish request may have succeeded")
         raise UploadError(message, stage="studio wait", diagnostics={
             "native": (f"reason=wait_timeout blocked_storage={self.gate.blocked_storage_requests} "
-                       f"apply_cdp={self.apply_intercepted} {self.gate.blocked_shape}").strip()})
+                       f"apply_cdp={self.apply_intercepted} cancelled_storage={self.storage_cancellations} {self.gate.blocked_shape}").strip()})
 
     def on_request_failed(self, request):
         if request == self.gate.request and self.error is None:
             self.error = PublishUncertainError("The Studio publish response was lost; inspect the account")
+
+    def on_network_failed(self, event):
+        # Network IDs join Fetch interception to a positive Chromium failure.
+        # URLs, credentials and request bodies are never retained for this join.
+        network_id = event.get("requestId")
+        if isinstance(network_id, str) and network_id in self.storage_network_ids:
+            self.failed_storage_network_ids.add(network_id)
 
     def on_auth_required(self, event):
         response = {"response": "CancelAuth"}
@@ -408,10 +443,26 @@ class _StudioSession:
         response_stage = "responseStatusCode" in event or "responseErrorReason" in event
         observed = self._upload_action(request["url"])
         apply = observed[1] if observed and observed[0] == "ApplyUploadInner" else None
+        parts = urlparse(request["url"])
+        target = (parts.netloc.lower(), parts.path[len("/upload/v1"):])
+        known_storage = (request["method"] == "POST" and parts.scheme == "https"
+                         and parts.path.startswith("/upload/v1/") and target in self.gate.storage_paths)
+        network_id = event.get("networkId")
         try:
+            if (not response_stage and known_storage and isinstance(network_id, str)
+                    and self.gate._allowed_preparation(SimpleNamespace(url=request["url"], method=request["method"]))):
+                if len(self.storage_network_ids) >= MAX_STORAGE_NETWORK_IDS and network_id not in self.storage_network_ids:
+                    raise _NativeRejected("network_tracking_limit")
+                self.storage_network_ids.add(network_id)
             if not response_stage:
+                # The request gate aborts unknown mutations (including telemetry).
+                # Do not ask Fetch for a response to those deliberate aborts:
+                # its stale interception can otherwise look like a failed upload.
+                candidate = SimpleNamespace(url=request["url"], method=request["method"])
+                intercept = (apply is not None or _publish_path(candidate) is not None
+                             or known_storage or (mutation and self.gate._allowed_preparation(candidate)))
                 self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"],
-                                                        "interceptResponse": mutation or apply is not None})
+                                                        "interceptResponse": intercept})
             elif apply is not None and "responseStatusCode" in event and not (300 <= event["responseStatusCode"] < 400):
                 # The SDK may start native storage immediately after reading
                 # Apply, before any asynchronous Playwright response callback.
@@ -428,10 +479,36 @@ class _StudioSession:
                 self.cdp.send("Fetch.failRequest", {"requestId": event["requestId"], "errorReason": "BlockedByClient"})
             else:
                 self.cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]})
-        except Exception:
+        except Exception as exc:
             if self.error is None:
+                text = str(exc)
+                reason = ("interception_cancelled" if "Invalid InterceptionId" in text or "Invalid interception id" in text
+                          else "body_unavailable" if "response body" in text.lower()
+                          else "target_closed" if "closed" in text.lower()
+                          else "protocol_error" if "Protocol error" in text else type(exc).__name__)
+                reason = reason if reason in ("interception_cancelled", "body_unavailable", "target_closed", "protocol_error", "TimeoutError", "Error") else "other"
+                if (reason == "interception_cancelled" and known_storage and not self.gate.armed and not self.gate.used
+                        and isinstance(network_id, str) and network_id in self.storage_network_ids):
+                    if network_id not in self.failed_storage_network_ids:
+                        # The loadingFailed notification may be queued just
+                        # behind the stale Fetch interception. Pump it briefly;
+                        # absence remains fatal, never evidence of cancellation.
+                        try:
+                            self.page.wait_for_timeout(50)
+                        except Exception:
+                            pass
+                    if network_id in self.failed_storage_network_ids:
+                        self.storage_cancellations = min(1000, self.storage_cancellations + 1)
+                        return
+                network_error = event.get("responseErrorReason")
+                network_error = network_error if network_error in ("Aborted", "Failed", "TimedOut", "ConnectionClosed", "BlockedByClient") else "none"
+                host = urlparse(request["url"]).netloc.lower()
+                storage = int(host in {h for h, _ in self.gate.storage_paths})
+                facts = (f"reason={reason} response_stage={int(response_stage)} mutation={int(mutation)} storage={storage} network_error={network_error} "
+                         f"network_tracked={int(network_id in self.storage_network_ids)} network_failed={int(network_id in self.failed_storage_network_ids)}")
                 self.error = (PublishUncertainError("Studio response interception failed after publication") if self.gate.used
-                              else UploadError("Studio response interception failed", stage="studio redirect guard"))
+                              else UploadError("Studio response interception failed", stage="studio redirect guard",
+                                               status=event.get("responseStatusCode"), diagnostics={"native": facts}))
 
     @staticmethod
     def _upload_action(url: str):
@@ -748,16 +825,67 @@ class BrowserStudioClient:
         prepared["media_id"] = session.media_id
         return session.media_id
 
+    def _set_checkbox(self, session, label, desired):
+        wrapper = session.page.get_by_text(label, exact=True).locator("xpath=ancestor-or-self::label[1]")
+        control = wrapper.locator("input[type='checkbox']")
+        if control.count() == 0:
+            control = session.page.locator(f"xpath=//label[.='{label}']/following-sibling::div/input")
+        if control.count() == 0:
+            return False
+        if control.count() != 1:
+            raise UploadError("Studio privacy control is ambiguous", stage="studio privacy",
+                              diagnostics={"native": f"reason=privacy_ambiguous controls={control.count()} wrappers={wrapper.count()}"})
+        if control.is_checked() != desired:
+            if wrapper.count() == 1 and not wrapper.is_visible():
+                expand = session.page.get_by_text("Show more", exact=True)
+                if expand.count() == 1 and expand.is_visible():
+                    expand.click(timeout=self.timeout * 1000)
+                    session.wait(lambda: wrapper.is_visible(), self.timeout,
+                                 "Studio additional privacy settings did not open")
+            if wrapper.count() == 1 and wrapper.is_visible() and wrapper.locator("input").count() == 1:
+                # The current native component hides its input. Activate its
+                # exact visible label, then prove the real input state changed.
+                wrapper.click(timeout=self.timeout * 1000)
+            elif control.is_visible():
+                control.set_checked(desired, timeout=self.timeout * 1000)
+            else:
+                raise UploadError("Studio privacy control is unavailable", stage="studio privacy",
+                                  diagnostics={"native": f"reason=privacy_unavailable controls={control.count()} wrappers={wrapper.count()}"})
+            session.wait(lambda: control.is_checked() == desired, self.timeout,
+                         "Studio did not retain the requested privacy setting")
+        return True
+
     def prepare_publish(self, prepared):
         session, page = prepared["session"], prepared["session"].page
         session.check()
+        # Studio's first-upload tour can cover Post despite its enabled state.
+        # Dismiss only the known tour through its own visible native control,
+        # before arming publication; never force-click through an unknown layer.
+        overlay = page.locator(".react-joyride__overlay")
+        if overlay.count() == 1 and overlay.is_visible():
+            dismiss = page.locator(".react-joyride__tooltip").get_by_role("button", name="Got it", exact=True)
+            if dismiss.count() != 1 or not dismiss.is_visible():
+                raise UploadError("Studio onboarding needs browser verification", stage="studio onboarding")
+            dismiss.click(timeout=self.timeout * 1000)
+            session.wait(lambda: overlay.count() == 0 or not overlay.is_visible(), self.timeout,
+                         "Studio onboarding did not close")
         editor = page.locator("div[contenteditable='true']")
         session.wait(lambda: editor.count() > 0, self.timeout, "Studio caption editor did not appear")
         if editor.count() != 1:
             raise UploadError("Studio caption editor is missing or ambiguous", stage="studio metadata")
+        # Clear through native keyboard events so the controlled editor state
+        # also drops prior content before the programmatic fill.
+        editor.press("ControlOrMeta+A", timeout=self.timeout * 1000)
+        editor.press("Backspace", timeout=self.timeout * 1000)
         editor.fill(prepared["caption"], timeout=self.timeout * 1000)
-        if editor.inner_text() != prepared["caption"]:
-            raise UploadError("Studio did not retain the exact caption", stage="studio metadata")
+        try:
+            session.wait(lambda: editor.inner_text() == prepared["caption"], self.timeout,
+                         "Studio did not retain the exact caption")
+        except UploadError as exc:
+            if exc.stage != "studio wait":
+                raise
+            raise UploadError("Studio did not retain the exact caption", stage="studio metadata",
+                              diagnostics={"native": "reason=caption_mismatch"}) from None
         label = "Only you" if prepared["visibility"] == 1 else "Everyone"
         dropdown = page.locator("[data-e2e='video_visibility_container'] button[role='combobox']")
         try:
@@ -774,11 +902,17 @@ class BrowserStudioClient:
         except Exception as exc:
             raise UploadError("Studio privacy control was unavailable", stage="studio privacy") from exc
         for label, key in (("Comment", "allow_comment"), ("Duet", "allow_duet"), ("Stitch", "allow_stitch")):
-            control = page.locator(f"xpath=//label[.='{label}']/following-sibling::div/input")
-            if control.count() == 1 and control.is_visible():
-                control.set_checked(bool(prepared[key]), timeout=self.timeout * 1000)
+            self._set_checkbox(session, label, bool(prepared[key]))
             # Some privacy/account types hide these controls. The native payload
             # still has to prove the exact desired values before any final send.
+        reuse = page.get_by_text("Reuse of content", exact=True).locator("xpath=ancestor-or-self::label[1]")
+        if reuse.count():
+            # The unified setting also permits stickers and Story reuse. Only
+            # the conservative disabled representation is supported here.
+            if reuse.count() != 1 or prepared["allow_duet"] or prepared["allow_stitch"]:
+                raise UploadError("Studio cannot represent the requested reuse settings", stage="studio privacy",
+                                  diagnostics={"native": f"reason=reuse_unsupported controls={reuse.count()}"})
+            self._set_checkbox(session, "Reuse of content", False)
         button = page.locator(POST_BUTTON)
         session.wait(lambda: button.count() == 1 and button.is_enabled() and button.get_attribute("data-disabled") != "true",
                      self.timeout, "Studio Post button did not become ready")
