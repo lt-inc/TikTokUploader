@@ -361,6 +361,15 @@ class Worker:
                 self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload. Uploads for this account are paused; the gateway code alone does not establish the cause." + summary,
                               retryable=True, retry_after_seconds=delay)
                 UPLOADS.labels("rate_limited").inc()
+            elif isinstance(exc, UploadError) and exc.apply_blocked:
+                # TikTok validated the session but refused the upload allocation before
+                # anything was published. Repeating the request only hammers the
+                # block; the account stays connected and no cooldown is invented.
+                self._failure(lease, "failed", "upload_preflight_failed",
+                              "The TikTok session is valid, but TikTok blocked the upload allocation for this account. "
+                              f"Nothing was published and it is not retried automatically ({exc.operator_summary()}).",
+                              retryable=False)
+                UPLOADS.labels("provider_blocked").inc()
             else:
                 # The failure code stays within Terex's existing contract; only
                 # the operator-visible text identifies the media download.

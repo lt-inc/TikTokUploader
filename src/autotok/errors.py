@@ -57,6 +57,7 @@ def _provider_code(payload) -> int | None:
 # never the provider's Code/Message text. The mapping is a diagnostic heuristic.
 _REASON_KEYWORDS = (
     ("rate_limited", ("too many", "rate limit", "throttl", "flowlimit", "frequen")),
+    ("request_blocked", ("blocked request", "request blocked")),
     ("region_restricted", ("region", "country")),
     ("auth_or_session_expired", ("expire", "unauthor", "authenticat", "credential", "invalid token", "login")),
     ("access_denied", ("access denied", "accessdenied", "forbidden")),
@@ -92,6 +93,9 @@ _STAGES = frozenset({
     "studio inline commit", "studio publish validation", "studio publish gate", "studio redirect",
     "studio redirect guard", "studio proxy auth", "studio privacy", "studio metadata", "studio onboarding",
     "studio submit"})
+
+
+APPLY_STAGES = frozenset({"apply upload", "studio ApplyUploadInner"})
 
 
 def safe_stage(stage: str | None) -> str:
@@ -204,6 +208,12 @@ class UploadError(AutotokError):
     @property
     def rate_limited(self) -> bool:
         return self._rate_limited or self.status == 429 or self.provider_code == 30411 or "too many request" in (self.body or "").lower()
+
+    @property
+    def apply_blocked(self) -> bool:
+        """Exact demonstrated refusal: Apply answered CodeN 30522 with the known blocked-request message family."""
+        return (self.stage in APPLY_STAGES and self.provider_code == 30522
+                and self.diagnostics.get("provider_reason") == "request_blocked")
 
     @property
     def safe_reason(self) -> str | None:

@@ -79,6 +79,14 @@ Diagnostics also carry a closed-set provider reason family (never the provider's
 Code/Message text), the transport exception class of wrapped network errors, and
 operator text with the closed-set stage and integer provider code.
 
+LT-Inc change (2026-11-02): an Apply stage (HTTP `apply upload` or native
+`studio ApplyUploadInner`) answering exactly CodeN 30522 with the known blocked-request
+message family (`request_blocked`) is reported as non-retryable `upload_preflight_failed`
+with operator text that the session is valid but TikTok blocked the upload allocation.
+It never marks the account for re-authentication, sets no cooldown and adds no
+route/protocol fallback; the final-send uncertainty fence is still evaluated first.
+Any other 30522 or stage keeps the previous retryable behaviour.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

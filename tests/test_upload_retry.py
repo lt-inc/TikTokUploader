@@ -148,6 +148,42 @@ def test_wrapped_transfer_error_reports_known_transport_class_not_text(publishin
     assert len(failed) == 1 and failed[0]["message"].endswith("(stage=upload part 1 transport=ReadTimeout)")
     assert "transport_class=ReadTimeout" in caplog.text and "do-not-log" not in caplog.text + failed[0]["message"]
 
+def blocked_response(code=30522, message="Blocked request"):
+    return response(200, {"ResponseMetadata": {"Error": {"CodeN": code, "Message": message}}})
+
+
+def test_known_blocked_apply_stops_retries_without_marking_account_or_cooldown(publishing, monkeypatch):
+    worker, store, seen = publishing
+    monkeypatch.setattr("autotok.uploader.impersonated_get", lambda *args, **kwargs: blocked_response())
+    monkeypatch.setattr(Client, "submit", lambda *args: pytest.fail("A refused upload must not publish"))
+    worker.execute({"publication_id": 17, "attempt_id": "attempt-17", "expected_version": 1})
+    failed = [payload for operation, payload in seen if operation == "fail"]
+    assert len(failed) == 1 and failed[0]["code"] == "upload_preflight_failed" and failed[0]["retryable"] is False
+    assert failed[0]["state"] == "failed" and "retry_after_seconds" not in failed[0] and failed[0]["reconnect_required"] is False
+    assert "provider_code=30522 reason=request_blocked" in failed[0]["message"]
+    assert store.get("upload-cooldown", 18) is None and store.get("account", 18)["status"] == "connected"
+
+
+@pytest.mark.parametrize("stage,code,message", [
+    ("create project", 30522, "Blocked request"), ("apply upload", 30411, "Blocked request"),
+    ("apply upload", 30522, "Access denied"), ("apply upload", 30522, "unrelated")])
+def test_only_exact_apply_blocked_refusal_is_final(stage, code, message):
+    assert UploadError.from_response(stage, blocked_response(code, message)).apply_blocked is False
+
+
+def test_blocked_apply_after_submit_barrier_stays_uncertain(publishing, monkeypatch):
+    worker, store, seen = publishing
+    monkeypatch.setattr(Client, "transfer", lambda *args: "media-id")
+    monkeypatch.setattr(Client, "prepare_publish", lambda self, prepared: prepared.update(payload={}, request=()))
+    def submit(self, *args):
+        raise UploadError.from_response("apply upload", blocked_response())
+    monkeypatch.setattr(Client, "_submit_publish_request", submit)
+    worker.execute({"publication_id": 18, "attempt_id": "attempt-18", "expected_version": 1})
+    failed = [payload for operation, payload in seen if operation == "fail"]
+    assert len(failed) == 1 and failed[0]["state"] == "needs_attention" and failed[0]["code"] == "upload_unknown"
+    assert failed[0]["retryable"] is False and store.get("publication", 18)["phase"] == "submitting"
+
+
 def test_media_download_failure_is_distinct_retryable_and_never_reaches_tiktok(publishing, monkeypatch, caplog):
     worker, store, seen = publishing
     def interrupted(*args):
