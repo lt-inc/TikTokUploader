@@ -30,6 +30,7 @@ from .errors import (
     PublishUncertainError,
     UploadError,
     ValidationError,
+    transport_error_class,
 )
 from .proxy import Proxy, parse_proxy, proxied_session
 from .signer import Signer
@@ -135,7 +136,7 @@ def _json(r: requests.Response, what: str) -> dict:
         return r.json()
     except ValueError:
         raise UploadError(f"{what}: TikTok returned a non-JSON response (HTTP {r.status_code})",
-                          status=r.status_code, body=r.text[:500]) from None
+                          status=r.status_code, body=r.text[:500], stage=what) from None
 
 
 def _cookie_for_url(session: requests.Session, name: str, url: str) -> str:
@@ -156,12 +157,16 @@ _DIAGNOSTIC_COOKIES = ("sessionid", "sid_tt", "sid_guard", "uid_tt", "ttwid", "m
 
 def _with_transport_facts(error: UploadError, session: requests.Session, url: str, response) -> UploadError:
     """Attach value-free facts that distinguish accounts/routes failing the same Apply request."""
-    header = session.prepare_request(requests.Request("GET", url)).headers.get("Cookie", "")
-    names = [item.strip().partition("=")[0] for item in header.split(";") if item.strip()]
+    try:
+        header = session.prepare_request(requests.Request("GET", url)).headers.get("Cookie", "")
+        names = [item.strip().partition("=")[0] for item in header.split(";") if item.strip()]
+    except Exception:  # diagnostics must never replace the provider failure they describe
+        names = None
     version = getattr(response, "http_version", None)
+    cookies = "unavailable" if names is None else f"{len(names)} present={','.join(n for n in _DIAGNOSTIC_COOKIES if n in names) or 'none'}"
     error.diagnostics["apply_transport"] = (
         f"client=chrome_impersonation http_version={version if type(version) is int and 0 <= version <= 99 else None}"
-        f" cookies={len(names)} present={','.join(n for n in _DIAGNOSTIC_COOKIES if n in names) or 'none'}")
+        f" cookies={cookies}")
     return error
 
 
@@ -227,7 +232,8 @@ class Client:
         try:
             r = session.request(method, url, timeout=timeout or self.timeout, **kwargs)
         except requests.RequestException as exc:
-            raise UploadError(f"{what}: network error: {type(exc).__name__}", stage=what) from exc
+            raise UploadError(f"{what}: network error: {type(exc).__name__}", stage=what,
+                              diagnostics={"transport_class": transport_error_class(exc)}) from exc
         if expect_ok and r.status_code != 200:
             raise UploadError.from_response(what, r)
         return r
@@ -244,7 +250,8 @@ class Client:
                                  proxies=self.proxy.for_requests() if self.proxy else None,
                                  timeout=self.timeout, allow_redirects=False)
         except Exception as exc:  # curl_cffi raises its own RequestException hierarchy
-            raise UploadError(f"apply upload: network error: {type(exc).__name__}", stage="apply upload") from exc
+            raise UploadError(f"apply upload: network error: {type(exc).__name__}", stage="apply upload",
+                              diagnostics={"transport_class": transport_error_class(exc)}) from exc
         if r.status_code != 200:
             raise _with_transport_facts(UploadError.from_response("apply upload", r), session, url, r)
         return r

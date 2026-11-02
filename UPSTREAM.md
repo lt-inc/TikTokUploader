@@ -75,6 +75,9 @@ LT-Inc change (2026-11-02): ApplyUploadInner refusals on the HTTP path log value
 transport facts (client, HTTP version, applicable cookie count and presence of a closed
 set of cookie names) to compare accounts/routes. No retry, cooldown or transport
 behaviour changed; unclassified provider codes keep the existing preflight failure.
+Diagnostics also carry a closed-set provider reason family (never the provider's
+Code/Message text), the transport exception class of wrapped network errors, and
+operator text with the closed-set stage and integer provider code.
 
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
