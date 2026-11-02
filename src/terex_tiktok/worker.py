@@ -340,6 +340,8 @@ class Worker:
                 self._failure(lease, "blocked", "auth_required", "TikTok account needs reconnection or browser verification.", reconnect_required=True)
                 UPLOADS.labels("needs_reauth").inc()
         except Exception as exc:
+            # Closed-set stage/code/reason only; never provider text or exception text.
+            summary = f" ({exc.operator_summary()})" if isinstance(exc, UploadError) and not media_failed else ""
             if external_started or journal.get("phase") in ("submitting", "accepted"):
                 self._failure(lease, "needs_attention", "upload_unknown", "The final publication result is uncertain. Check the post; automatic upload retry is blocked.")
                 UPLOADS.labels("uncertain").inc()
@@ -356,14 +358,23 @@ class Worker:
                                    {"remote_account_id": journal["remote_account_id"], "not_before": until})
                 # CodeN 30411 can also be a web-client refusal; a longer wait
                 # controls retries but does not establish the underlying cause.
-                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload. Uploads for this account are paused; the gateway code alone does not establish the cause.",
+                self._failure(lease, "failed", "tiktok_rate_limited", "TikTok refused the upload. Uploads for this account are paused; the gateway code alone does not establish the cause." + summary,
                               retryable=True, retry_after_seconds=delay)
                 UPLOADS.labels("rate_limited").inc()
+            elif isinstance(exc, UploadError) and exc.apply_blocked:
+                # TikTok validated the session but refused the upload allocation before
+                # anything was published. Repeating the request only hammers the
+                # block; the account stays connected and no cooldown is invented.
+                self._failure(lease, "failed", "upload_preflight_failed",
+                              "The TikTok session is valid, but TikTok blocked the upload allocation for this account. "
+                              f"Nothing was published and it is not retried automatically ({exc.operator_summary()}).",
+                              retryable=False)
+                UPLOADS.labels("provider_blocked").inc()
             else:
                 # The failure code stays within Terex's existing contract; only
                 # the operator-visible text identifies the media download.
                 message = ("Media download failed before publication; nothing was sent to TikTok and it is safe to retry."
-                           if media_failed else "Preparation/transfer failed before publication; safe to retry.")
+                           if media_failed else "Preparation/transfer failed before publication; safe to retry." + summary)
                 self._failure(lease, "failed", "upload_preflight_failed", message, retryable=True)
                 UPLOADS.labels("media_download_failed" if media_failed else "preflight_failed").inc()
             # Upload bodies and exception text can include temporary credentials
@@ -372,6 +383,8 @@ class Worker:
             if isinstance(exc, UploadError):
                 detail = f" stage={exc.stage!r} status={exc.status} provider_code={exc.provider_code} retry_after_seconds={exc.retry_after_seconds}"
                 detail += f" response_kind={exc.diagnostics.get('response_kind')} request_id_tag={exc.diagnostics.get('request_id_tag')} native={exc.diagnostics.get('native')}"
+                detail += f" apply_transport={exc.diagnostics.get('apply_transport')} provider_reason={exc.safe_reason}"
+                detail += f" transport_class={exc.safe_transport}"
             log.warning("upload failed %s phase=%s error_type=%s%s", context, journal["phase"], type(exc).__name__, detail)
         finally:
             if prepared:
