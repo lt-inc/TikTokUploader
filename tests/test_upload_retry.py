@@ -115,6 +115,20 @@ def test_pre_submit_refusal_defers_account_without_sending_or_losing_session(
         assert "request_id_tag=" + hashlib.sha256(request_id.encode()).hexdigest()[:16] in caplog.text
 
 
+def test_unclassified_apply_refusal_logs_value_free_transport_facts_without_cooldown(publishing, monkeypatch, caplog):
+    worker, store, seen = publishing
+    refused = response(200, {"ResponseMetadata": {"Error": {"CodeN": 30522, "Message": "do-not-log"}}})
+    monkeypatch.setattr("autotok.uploader.impersonated_get", lambda *args, **kwargs: refused)
+    monkeypatch.setattr(Client, "submit", lambda *args: pytest.fail("A refused upload must not publish"))
+    worker.execute({"publication_id": 15, "attempt_id": "attempt-15", "expected_version": 1})
+    failed = [payload for operation, payload in seen if operation == "fail"]
+    assert len(failed) == 1 and failed[0]["code"] == "upload_preflight_failed" and failed[0]["retryable"] is True
+    assert store.get("upload-cooldown", 18) is None
+    assert "provider_code=30522" in caplog.text
+    assert "apply_transport=client=chrome_impersonation http_version=None cookies=1 present=sessionid" in caplog.text
+    assert "session-secret" not in caplog.text and "do-not-log" not in caplog.text
+
+
 def test_media_download_failure_is_distinct_retryable_and_never_reaches_tiktok(publishing, monkeypatch, caplog):
     worker, store, seen = publishing
     def interrupted(*args):

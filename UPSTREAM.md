@@ -71,6 +71,11 @@ verification now share Studio's first-party cookie selection. TikTok can set
 regional `.tiktokw.eu` cookies; validating the entire browser jar incorrectly
 rejected an otherwise valid login. External session imports remain strict.
 
+LT-Inc change (2026-11-02): ApplyUploadInner refusals on the HTTP path log value-free
+transport facts (client, HTTP version, applicable cookie count and presence of a closed
+set of cookie names) to compare accounts/routes. No retry, cooldown or transport
+behaviour changed; unclassified provider codes keep the existing preflight failure.
+
 Preserve LICENSE and THIRD_PARTY_NOTICES.md. Three `signer_js` assets retain
 their separately documented origins/rights and are not uniformly covered by
 the core AGPL declaration. This service offers its corresponding source through

@@ -149,6 +149,22 @@ def _cookie_for_url(session: requests.Session, name: str, url: str) -> str:
     return ""
 
 
+# Cookie names are not secret; values never leave the jar. Closed set keeps logs bounded.
+_DIAGNOSTIC_COOKIES = ("sessionid", "sid_tt", "sid_guard", "uid_tt", "ttwid", "msToken", "tt_csrf_token",
+                       "tt_chain_token", "s_v_web_id", "odin_tt", "passport_csrf_token", "tt-target-idc")
+
+
+def _with_transport_facts(error: UploadError, session: requests.Session, url: str, response) -> UploadError:
+    """Attach value-free facts that distinguish accounts/routes failing the same Apply request."""
+    header = session.prepare_request(requests.Request("GET", url)).headers.get("Cookie", "")
+    names = [item.strip().partition("=")[0] for item in header.split(";") if item.strip()]
+    version = getattr(response, "http_version", None)
+    error.diagnostics["apply_transport"] = (
+        f"client=chrome_impersonation http_version={version if type(version) is int and 0 <= version <= 99 else None}"
+        f" cookies={len(names)} present={','.join(n for n in _DIAGNOSTIC_COOKIES if n in names) or 'none'}")
+    return error
+
+
 class Client:
     """An authenticated TikTok uploader for one account.
 
@@ -230,7 +246,7 @@ class Client:
         except Exception as exc:  # curl_cffi raises its own RequestException hierarchy
             raise UploadError(f"apply upload: network error: {type(exc).__name__}", stage="apply upload") from exc
         if r.status_code != 200:
-            raise UploadError.from_response("apply upload", r)
+            raise _with_transport_facts(UploadError.from_response("apply upload", r), session, url, r)
         return r
 
     def check_session(self) -> bool:
@@ -402,7 +418,8 @@ class Client:
             store_uri, store_auth = store["StoreUri"], store["Auth"]
             upload_host, session_key = node["UploadHost"], node["SessionKey"]
         except (KeyError, IndexError, TypeError):
-            raise UploadError.from_response("apply upload", response, payload=apply) from None
+            raise _with_transport_facts(UploadError.from_response("apply upload", response, payload=apply),
+                                        session, url, response) from None
 
         upload_id = str(uuid.uuid4())
         crcs: list[str] = []
